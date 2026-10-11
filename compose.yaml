@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: luma
+      POSTGRES_USER: luma
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U luma -d luma']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  web:
+    build: .
+    restart: unless-stopped
+    ports: ['127.0.0.1:3000:3000']
+    environment: &app_environment
+      DATABASE_URL: postgresql://luma:${POSTGRES_PASSWORD}@postgres:5432/luma
+      SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY:?Set SOURCE_ENCRYPTION_KEY in .env}
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:3000}
+      HEALTH_CONCURRENCY: ${HEALTH_CONCURRENCY:-3}
+      WORKER_LOG_LEVEL: ${WORKER_LOG_LEVEL:-normal}
+      HEALTH_FAILURE_THRESHOLD: ${HEALTH_FAILURE_THRESHOLD:-3}
+      HEALTH_INTERVAL_MS: ${HEALTH_INTERVAL_MS:-21600000}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      MEDIA_CONVERSION: ${MEDIA_CONVERSION:-true}
+      MEDIA_MAX_PROCESSES: ${MEDIA_MAX_PROCESSES:-2}
+      METADATA_PROVIDER_URL: ${METADATA_PROVIDER_URL:-}
+      METADATA_API_KEY: ${METADATA_API_KEY:-}
+      METADATA_AUTO_ENRICH: ${METADATA_AUTO_ENRICH:-true}
+      METADATA_LANGUAGE: ${METADATA_LANGUAGE:-en}
+      METADATA_USER_AGENT: '${METADATA_USER_AGENT:-Lume-Metadata/1.0 (automatic catalog lookup)}'
+      TMDB_READ_ACCESS_TOKEN: ${TMDB_READ_ACCESS_TOKEN:-}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      PLAYBACK_SIGNER_URL: ${PLAYBACK_SIGNER_URL:-}
+      PLAYBACK_SIGNER_API_KEY: ${PLAYBACK_SIGNER_API_KEY:-}
+      REQUIRE_PLAYBACK_SIGNER: ${REQUIRE_PLAYBACK_SIGNER:-false}
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  worker:
+    build: .
+    restart: unless-stopped
+    command: [node, scripts/run.cjs, worker]
+    environment: *app_environment
+    depends_on:
+      postgres: {condition: service_healthy}
+volumes:
+  postgres:

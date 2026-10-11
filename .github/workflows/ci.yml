@@ -1,0 +1,26 @@
+name: Verify application
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run init
+      - run: npm run worker -- --once
+      - run: npx playwright install --with-deps chromium
+      - run: npm run dev > /tmp/luma.log 2>&1 &
+      - run: node -e "const f=async()=>{for(let i=0;i<60;i++){try{if((await fetch('http://127.0.0.1:3000/api/health')).ok)return}catch{}await new Promise(r=>setTimeout(r,1000))}process.exit(1)};f()"
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-test-report
+          path: playwright-report/

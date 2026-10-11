@@ -1,0 +1,20 @@
+# Feature coverage
+
+| Requested area | Implementation | Verification boundary |
+|---|---|---|
+| Premium responsive frontend | Original Lume identity; cinematic hero, carousels, title details, search/filtering, account/admin/player pages, skeletons, transitions, keyboard/focus support | Production build/typecheck; browser visual/mobile review blocked |
+| Database and API | Normalized PostgreSQL/SQLite SQL schema, indexes, migrations, server handlers, persistent users/profiles/catalog/sources/history/lists/audits | SQLite unit/integration tests; PostgreSQL deployment untested |
+| M3U importing | URL and file/multiple-playlist UI; attributes, groups, aliases, classification, episode grouping, external IDs, ambiguous-review queue | Parser/import integration tests |
+| Refresh scheduler | Independent persistent worker, durable leased jobs with heartbeat, retry/backoff/deduplication, refresh intervals, reports, encrypted snapshots/recovery | Deterministic leasing/synchronization tests; no production load test |
+| Independent health checks | Playlist validation separately from MP4/WebM/HLS/DASH resource verification; sampled segments, bounded concurrency, repeated-failure thresholds, automatic visibility/restoration | Injected failure tests and actual four-source live checks |
+| Multiple servers | Separate sources per movie/episode, confirmed deduplication, merge/split/reassignment, priority and health ranking | Matching, preservation, availability and selection tests |
+| Custom player | Native/HLS.js/DASH.js, custom controls, seek/volume/speed/fullscreen/PiP, tracks/quality from engine, server switching/failover, episode navigation/autoplay, valid intro/recap timestamps | Unit selection/progress tests; real browser playback/track/fullscreen/PiP tests remain unexecuted |
+| Optional accounts | Browsing/playback without login; validated persistent guest progress/list; secure sessions, server progress/history/list/favorites/preferences; explicit migration consent | Backend/session/progress/migration integration tests |
+| Administration | Role enforcement, dashboard metrics, playlists/import reports, metadata, classifications, episodes/sources, duplicate review, snapshots, audit log | API permission and workflow tests; browser UI flows unexecuted |
+| Search/discovery | Real database search by titles/aliases/people/genre, typo matching, filters/pagination; actual viewing popularity; verified-only recommendations; older saved items retrieved independently | Backend and discovery/collection tests |
+| Security | scrypt, hashed HttpOnly sessions, authorization, same-origin mutations, rate limits, encrypted credentials, DNS-pinned HTTP(S) requests, no public proxy; media destinations accept local/private hosts and any port by explicit request; authenticated uploads have no application size cap | Deterministic tests; independent Internet-facing review still needed |
+| Private playback providers | Real server-to-server signing adapter, short-lived public HTTPS grants, fail-closed configuration, bounded player renewal | Adapter tests; actual licensed signing provider not configured |
+| Authorized sample catalog | Two actual full Blender open films and clearly labeled Sintel trailer; matching posters/stills/credits; imported through same real pipeline | Live monitoring/sample decode verified; availability may change |
+| Deployment/testing | Docker services, non-root runtime, environment template, CI, automated unit/integration tests and authored Playwright E2E scenarios | Local production build completed; Docker unavailable and E2E environment blocked |
+
+The following are not represented as complete: licensed DRM integration, email verification/password recovery, production object-storage asset uploads, multi-profile selection/progress UI, automatic archival retention, production observability alerts, multi-worker/high-volume deployment certification, and multi-browser/device QA. Optional profile tables are present; the default account uses its primary profile. Billing/subscriptions were not requested and are not implemented.

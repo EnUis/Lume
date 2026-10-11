@@ -1,0 +1,42 @@
+{
+  "name": "luma-streaming",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "next build --webpack",
+    "start": "next start --hostname 0.0.0.0",
+    "init": "node scripts/run.cjs init",
+    "worker": "node scripts/run.cjs worker",
+    "admin": "node scripts/run.cjs create-admin",
+    "repair-languages": "node scripts/run.cjs repair-languages",
+    "backfill-metadata": "node scripts/run.cjs backfill-metadata",
+    "test": "vitest run --config vitest.config.mjs --configLoader native",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "dashjs": "^5.0.0",
+    "git": "^0.1.5",
+    "hls.js": "^1.6.0",
+    "lucide-react": "^0.468.0",
+    "next": "^16.0.0",
+    "pg": "^8.16.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,9 @@
+CREATE INDEX IF NOT EXISTS sources_public_health ON sources(health,enabled,removed,title_id,episode_id,playlist_id,last_success);
+CREATE INDEX IF NOT EXISTS sources_playlist_status ON sources(removed,playlist_id,enabled,health);
+CREATE INDEX IF NOT EXISTS sources_playlist_url ON sources(playlist_id,url_hash);
+CREATE INDEX IF NOT EXISTS jobs_type_recent ON jobs(type,created_at);
+CREATE INDEX IF NOT EXISTS jobs_recent ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS review_pending_source ON review_queue(status,source_id,title_id);
+CREATE INDEX IF NOT EXISTS review_title_status ON review_queue(title_id,status);
+CREATE INDEX IF NOT EXISTS review_source_status ON review_queue(source_id,status);
+CREATE INDEX IF NOT EXISTS metadata_title_provider ON metadata_identifiers(title_id,provider);

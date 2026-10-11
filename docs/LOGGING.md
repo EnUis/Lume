@@ -1,0 +1,11 @@
+# Worker logging
+
+The worker defaults to `WORKER_LOG_LEVEL=normal`. Successful job completion and ordinary verification outcomes stay quiet, including provider HTTP 401/403 access-denied results. Import, source-health and failed-job reports remain fully recorded in the database and visible in administration. Quiet logging does not mark a failed stream healthy or alter retry/backoff behavior.
+
+Unexpected application, database, scheduling, heartbeat and lease-renewal errors remain visible as concise messages on standard error. The first occurrence is printed immediately. Identical errors across jobs are counted and summarized at most once per minute, with pending repeat counts printed during a clean shutdown. Different error reasons appear immediately. Lease-renewal errors, which were previously ignored, now appear through this same reporting path.
+
+A fatal consumer failure stops new job claims immediately and waits for other active consumers before closing the database. Their job leases and worker heartbeat continue during this drain; already claimed jobs still record normal completion or retry results. Shutdown also waits for pending heartbeat/lease writes. Failed jobs retain the existing retry/backoff and ownership checks, and a forcibly terminated process still relies on lease expiry for recovery.
+
+Set `WORKER_LOG_LEVEL=diagnostic` and restart the worker when investigating a problem. This explicitly enables JSON completion/failure events. Diagnostic completion records contain only selected status, verification and import-count fields; they never serialize raw job payloads, playlist contents, source URLs or arbitrary report fields. Error messages redact URLs, connection strings, tokens and credential headers. Diagnostic mode prints repeated failures individually, so return to `normal` after investigation.
+
+With local `npm run dev`, restart the supervised worker or development process after changing this setting. Docker services receive it from the shared environment in `compose.yaml`. Next.js logging is configured separately: routine incoming-request logs are disabled and browser-to-terminal forwarding is limited to errors. Build status and unexpected application API errors remain visible.
