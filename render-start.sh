@@ -1,35 +1,54 @@
+
 #!/bin/sh
 set -eu
 
 # ==========================================
-# LUME - RENDER PRODUCTION STARTUP
-# Tailscale + PostgreSQL + Next.js
+# LUME - RENDER STARTUP
+# Tailscale TCP Gateway + PostgreSQL + Web
 # ==========================================
 
-: "${TAILSCALE_DB_HOST:?Missing TAILSCALE_DB_HOST}"
-: "${DATABASE_URL:?Missing DATABASE_URL}"
+: "${TAILSCALE_DB_HOST:?TAILSCALE_DB_HOST is missing}"
+: "${DATABASE_URL:?DATABASE_URL is missing}"
 
 KEY_FILE="/etc/secrets/tailscale-authkey"
 TS_DIR="/tmp/lume-tailscale"
 TS_SOCKET="$TS_DIR/tailscaled.sock"
 
-SOCKS_PORT=1055
 GATEWAY_PORT=15432
 REMOTE_DB_PORT=5432
 
 # ==========================================
-# CHECK TAILSCALE AUTH KEY
+# VALIDATE SETTINGS
 # ==========================================
 
+echo "Validating database configuration..."
+
+node - <<'JS'
+const url = new URL(process.env.DATABASE_URL);
+
+if (
+  url.hostname !== "127.0.0.1" ||
+  url.port !== "15432" ||
+  url.pathname !== "/lume_pc"
+) {
+  console.error(
+    "ERROR: DATABASE_URL must point to 127.0.0.1:15432/lume_pc"
+  );
+  process.exit(1);
+}
+
+console.log("Database URL configuration valid");
+JS
+
 if [ ! -r "$KEY_FILE" ]; then
-    echo "ERROR: Tailscale authentication key missing"
+    echo "ERROR: Tailscale auth key file missing"
     exit 1
 fi
 
 mkdir -p "$TS_DIR"
 
 # ==========================================
-# START TAILSCALE DAEMON
+# START TAILSCALE
 # ==========================================
 
 echo "Starting Tailscale..."
@@ -37,19 +56,16 @@ echo "Starting Tailscale..."
 tailscaled \
     --tun=userspace-networking \
     --socket="$TS_SOCKET" \
-    --state="$TS_DIR/state" \
-    --socks5-server="127.0.0.1:$SOCKS_PORT" &
+    --state="$TS_DIR/state" &
 
 TS_PID=$!
 
-# Wait for socket
 i=0
-
 until [ -S "$TS_SOCKET" ]; do
     i=$((i + 1))
 
     if [ "$i" -ge 30 ]; then
-        echo "ERROR: Tailscale daemon failed to start"
+        echo "ERROR: Tailscale socket not ready"
         exit 1
     fi
 
@@ -62,7 +78,7 @@ until [ -S "$TS_SOCKET" ]; do
 done
 
 # ==========================================
-# AUTHENTICATE TAILSCALE
+# AUTHENTICATE
 # ==========================================
 
 echo "Authenticating Tailscale..."
@@ -75,73 +91,103 @@ tailscale --socket="$TS_SOCKET" up \
 echo "Tailscale authenticated"
 
 # ==========================================
-# CHECK DATABASE NETWORK CONNECTION
+# START TCP DATABASE GATEWAY
+# Uses Tailscale native nc, not SOCKS5
 # ==========================================
 
-echo "Checking PostgreSQL through Tailscale..."
-
-CONNECTED=false
-ATTEMPT=1
-
-while [ "$ATTEMPT" -le 5 ]; do
-
-    echo "Database connection test $ATTEMPT/5"
-
-    if ncat \
-        --proxy "127.0.0.1:$SOCKS_PORT" \
-        --proxy-type socks5 \
-        --wait 10 \
-        -z \
-        "$TAILSCALE_DB_HOST" "$REMOTE_DB_PORT"
-    then
-        CONNECTED=true
-        break
-    fi
-
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 2
-done
-
-if [ "$CONNECTED" != "true" ]; then
-    echo "ERROR: PostgreSQL is unreachable through Tailscale"
-    echo "Check Tailscale ACLs, Windows Tailscale Serve, and PostgreSQL"
-    exit 1
-fi
-
-echo "PostgreSQL TCP connection successful"
-
-# ==========================================
-# START LOCAL POSTGRESQL GATEWAY
-# ==========================================
-
-echo "Starting PostgreSQL gateway..."
+echo "Starting Tailscale PostgreSQL gateway..."
 
 ncat \
     --listen 127.0.0.1 "$GATEWAY_PORT" \
     --keep-open \
-    --sh-exec 'exec ncat --proxy 127.0.0.1:1055 --proxy-type socks5 "$TAILSCALE_DB_HOST" 5432' &
+    --sh-exec "exec tailscale --socket=$TS_SOCKET nc $TAILSCALE_DB_HOST $REMOTE_DB_PORT" &
 
 GATEWAY_PID=$!
 
-sleep 2
+sleep 1
 
 if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    echo "ERROR: PostgreSQL gateway failed to start"
+    echo "ERROR: Database gateway failed to start"
     exit 1
 fi
 
-echo "PostgreSQL gateway listening on 127.0.0.1:$GATEWAY_PORT"
+echo "Database gateway process started"
 
 # ==========================================
-# START LUME WEBSITE
+# VERIFY ACTUAL POSTGRESQL CONNECTION
 # ==========================================
 
-echo "Starting Lume web server..."
+echo "Testing real PostgreSQL authentication..."
 
-exec node server.js
-# START LUME APPLICATION
-# =====================================
+node - <<'JS'
+const { Client } = require("pg");
 
+async function verifyDatabase() {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const client = new Client({
+      connectionString: process.env.DATABASE_URL,
+      connectionTimeoutMillis: 12000
+    });
+
+    try {
+      await client.connect();
+
+      const result = await client.query(`
+        SELECT
+          current_database() AS database,
+          COUNT(*)::integer AS tables
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+      `);
+
+      const row = result.rows[0];
+
+      console.log("Connected to database:", row.database);
+      console.log("Visible tables:", row.tables);
+
+      if (row.database !== "lume_pc" || row.tables === 0) {
+        throw new Error(
+          "Wrong database or no application tables"
+        );
+      }
+
+      await client.end();
+
+      console.log("PostgreSQL connection verified");
+      return;
+    } catch (error) {
+      console.error(
+        `Database test ${attempt}/3 failed:`,
+        error.message
+      );
+
+      try {
+        await client.end();
+      } catch (_) {}
+
+      if (attempt < 3) {
+        await new Promise(resolve =>
+          setTimeout(resolve, 2000)
+        );
+      }
+    }
+  }
+
+  console.error(
+    "ERROR: Could not establish PostgreSQL connection"
+  );
+  process.exitCode = 1;
+}
+
+verifyDatabase();
+JS
+
+# ==========================================
+# START LUME
+# ==========================================
+
+echo "Database check passed"
 echo "Starting Lume web server..."
 
 exec node server.js
