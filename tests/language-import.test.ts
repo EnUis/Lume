@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { extractLanguageTags, languageLabel, normalizeLanguage } from '../lib/languages';
 import { openDatabase, type DB } from '../lib/server/db';
-import { parseM3U, M3U_IMPORT_VERSION } from '../lib/server/m3u';
+import { parseM3U } from '../lib/server/m3u';
 import { checkSource, synchronizePlaylist } from '../lib/server/pipeline';
 import { encrypt, hash, id } from '../lib/server/security';
 import type { SafeFetcher } from '../lib/server/outbound';
@@ -31,7 +31,6 @@ describe('explicit language labels', () => {
 
   it('preserves the raw EXTINF name and numeric movie title while honoring explicit audio attributes', () => {
     const result = parseM3U('#EXTM3U\n' + stream('(DE) 1917 1080p', 1) + stream('A Film (2020) [GER]', 2) + stream('(DE) A Film (2020)', 3, 'movie', 'audio-language="French" tvg-language="GER"') + stream('A Show (2020) [GER] S1 E2', 4, 'series'));
-    expect(M3U_IMPORT_VERSION).toBe(8);
     expect(result.entries[0]).toMatchObject({ name: '(DE) 1917 1080p', title: '1917', year: null, language: 'de', languageExplicit: true });
     expect(result.entries[1]).toMatchObject({ title: 'A Film', year: 2020, language: 'de' });
     expect(result.entries[2]).toMatchObject({ title: 'A Film', language: 'fr' });

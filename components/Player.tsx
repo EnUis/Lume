@@ -8,12 +8,13 @@ import { chooseLanguageSource, convertedSeek, mediaPosition, mediaDuration, fail
 import { languageLabel, normalizeLanguage } from '@/lib/languages';
 import { mergeProgress, progressKey, readGuestProgress, saveGuestProgress } from '@/lib/progress';
 import { canonicalizeTitleProgress, selectPlaybackEpisode } from '@/lib/player-progress';
+import { needsServerPlayback, playbackFetch, playRejection, type PlaybackCapabilities } from '@/lib/player-device';
 import './player.css';
 
 type Option = { id: string; label: string; language?: string };
 type Adapter = { destroy: () => void; quality?: (id: string) => void; audio?: (id: string) => void; caption?: (id: string) => void };
 type NativeAudioTrack = { id: string; label: string; language: string; enabled: boolean };
-type ExtendedVideo = HTMLVideoElement & { audioTracks?: { length: number; [index: number]: NativeAudioTrack } };
+type ExtendedVideo = HTMLVideoElement & { audioTracks?: { length: number; [index: number]: NativeAudioTrack }; webkitDisplayingFullscreen?: boolean; webkitEnterFullscreen?: () => void; webkitExitFullscreen?: () => void };
 type DashTrack = { id?: string; lang?: string; labels?: { text: string }[]; index?: number };
 type DashRepresentation = { id: string; height?: number; bandwidth?: number; bitrate?: number };
 type DashPlayer = {
@@ -37,6 +38,10 @@ function trackLabel(track: { label?: string; name?: string; lang?: string; langu
 function refreshCatalog() {
   window.dispatchEvent(new CustomEvent('luma-catalog-refresh'));
   try { localStorage.setItem('luma.catalog.updatedAt', String(Date.now())); } catch { /* Current-tab invalidation remains available. */ }
+}
+
+function deviceCapabilities(video: HTMLVideoElement): PlaybackCapabilities {
+  return { pageUrl: window.location.href, nativeHls: !!video.canPlayType('application/vnd.apple.mpegurl'), mediaSource: typeof MediaSource !== 'undefined' || !!(window as Window & { ManagedMediaSource?: unknown }).ManagedMediaSource, mp4: !!video.canPlayType('video/mp4'), webm: !!video.canPlayType('video/webm') };
 }
 
 function browserCompatible(source: Source): boolean {
@@ -100,6 +105,8 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
   const [notice, setNotice] = useState('');
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(false);
+  const [awaitingPlay, setAwaitingPlay] = useState(true);
+  const playRequestRef = useRef<() => void>(() => {});
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
   const [buffered, setBuffered] = useState(0);
@@ -137,10 +144,10 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     setLoading(true);
     setError('');
     Promise.all([
-      fetch(`/api/titles/${encodeURIComponent(titleId)}`, { signal: controller.signal }).then(response => responseJson<{ title: Title }>(response)),
-      fetch('/api/auth/me', { signal: controller.signal }).then(response => responseJson<{ user: User | null }>(response)).catch(() => ({ user: null })),
-      fetch('/api/progress', { signal: controller.signal }).then(response => responseJson<{ progress: Progress[] }>(response)).catch(() => ({ progress: [] })),
-      fetch('/api/preferences', { signal: controller.signal }).then(response => responseJson<{ preferences: { autoplay: boolean; language: string } }>(response)).catch(() => null),
+      playbackFetch(`/api/titles/${encodeURIComponent(titleId)}`, { signal: controller.signal }, 30000, 16 * 1024 * 1024).then(response => responseJson<{ title: Title }>(response)),
+      playbackFetch('/api/auth/me', { signal: controller.signal }).then(response => responseJson<{ user: User | null }>(response)).catch(() => ({ user: null })),
+      playbackFetch('/api/progress', { signal: controller.signal }).then(response => responseJson<{ progress: Progress[] }>(response)).catch(() => ({ progress: [] })),
+      playbackFetch('/api/preferences', { signal: controller.signal }).then(response => responseJson<{ preferences: { autoplay: boolean; language: string } }>(response)).catch(() => null),
     ]).then(([detail, auth, history, preference]) => {
       if (controller.signal.aborted) return;
       accountRef.current = auth.user;
@@ -188,7 +195,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     setEnded(false);
     setError('');
     setSourceLoading(true);
-    fetch(`/api/playback/${encodeURIComponent(title.id)}${episodeId ? `?episodeId=${encodeURIComponent(episodeId)}` : ''}`, { signal: controller.signal })
+    playbackFetch(`/api/playback/${encodeURIComponent(title.id)}${episodeId ? `?episodeId=${encodeURIComponent(episodeId)}` : ''}`, { signal: controller.signal }, 30000)
       .then(response => responseJson<{ sources: Source[] }>(response)).then(result => {
         if (controller.signal.aborted) return;
         const available = rankSources(result.sources, browserCompatible);
@@ -256,7 +263,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
       // One bounded attempt after a short backoff, rather than a renewal/error loop.
       await new Promise(resolve => setTimeout(resolve, 400));
       if (controller.signal.aborted || generation !== playbackGeneration.current) return;
-      const response = await fetch(`/api/playback/${encodeURIComponent(meta.title.id)}${meta.episodeId ? `?episodeId=${encodeURIComponent(meta.episodeId)}` : ''}`, { signal: controller.signal });
+      const response = await playbackFetch(`/api/playback/${encodeURIComponent(meta.title.id)}${meta.episodeId ? `?episodeId=${encodeURIComponent(meta.episodeId)}` : ''}`, { signal: controller.signal }, 30000);
       const result = await responseJson<{ sources: Source[] }>(response);
       if (controller.signal.aborted || generation !== playbackGeneration.current) return;
       const renewed = rankSources(result.sources, browserCompatible);
@@ -308,11 +315,11 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
       try {
         let token = failed.playbackAttemptToken;
         if (token && failed.playbackAttemptExpiresAt && failed.playbackAttemptExpiresAt <= Date.now() + 1000) {
-          const response = await fetch('/api/playback/attempt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: failedId, playbackAttemptToken: token }), signal: AbortSignal.timeout(8000) });
+          const response = await playbackFetch('/api/playback/attempt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: failedId, playbackAttemptToken: token }) });
           token = (await responseJson<{ source: Source }>(response)).source.playbackAttemptToken;
         }
         if (!token) throw new Error('Playback verification could not be recorded.');
-        const response = await fetch('/api/playback/failure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: failedId, playbackAttemptToken: token }), signal: AbortSignal.timeout(8000) });
+        const response = await playbackFetch('/api/playback/failure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: failedId, playbackAttemptToken: token }) });
         if (!response.ok) throw new Error('Playback verification could not be recorded.');
       } catch { availabilityWarning = 'Availability could not be updated. '; }
       refreshCatalog();
@@ -344,7 +351,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     videoRef.current?.pause(); setSourceLoading(true); setBuffering(true); setError(''); setNotice(metadataRef.current.title?.type === 'live' ? 'Connecting to the live broadcast.' : 'Preparing playback. Your place will be kept.');
     const current = () => !controller.signal.aborted && generation === sourceGeneration.current && playback === playbackGeneration.current;
     try {
-      const response = await fetch('/api/playback/prepare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: active.id, playbackAttemptToken: active.playbackAttemptToken, startAt: position, audioTrack, previousSessionId: active.conversion?.sessionId }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(90000)]) });
+      const response = await playbackFetch('/api/playback/prepare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: active.id, playbackAttemptToken: active.playbackAttemptToken, startAt: position, audioTrack, previousSessionId: active.conversion?.sessionId, delivery: videoRef.current && deviceCapabilities(videoRef.current).nativeHls ? 'hls' : 'mp4' }), signal: controller.signal }, 90000);
       const fresh = (await responseJson<{ source: Source }>(response)).source;
       if (!current()) { if (fresh.conversion) void fetch('/api/playback/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: fresh.conversion.sessionId }) }); return; }
       sourcesRef.current = sourcesRef.current.map(entry => entry.id === active.id ? fresh : entry); setSources(sourcesRef.current);
@@ -362,7 +369,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     const video = videoRef.current;
     const active = sourcesRef.current.find(entry => entry.id === activeId);
     if (!video || !active?.url) return;
-    if (!active.conversion && (active.conversionRequired || active.format === 'unknown')) { void prepareRef.current(seekRef.current); return; }
+    if (needsServerPlayback(active, deviceCapabilities(video))) { void prepareRef.current(seekRef.current); return; }
     conversionRef.current = active.conversion;
     if (active.conversion) { setDuration(active.conversion.duration || 0); seekRef.current = 0; currentTimeRef.current = active.conversion.startAt; setPosition(active.conversion.startAt); }
     const generation = ++sourceGeneration.current;
@@ -375,6 +382,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     let successEvidence = new PlaybackSuccessEvidence();
     let renewalPending = false;
     setBuffering(true);
+    setAwaitingPlay(!playIntent.current);
     setQualities([]);
     setAudios([]);
     setCaptions([]);
@@ -389,7 +397,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
       if (renewalPending || !current() || !playbackAttempt.playbackAttemptToken) return;
       renewalPending = true;
       try {
-        const response = await fetch('/api/playback/attempt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: active.id, playbackAttemptToken: playbackAttempt.playbackAttemptToken }), signal: AbortSignal.timeout(8000) });
+        const response = await playbackFetch('/api/playback/attempt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: active.id, playbackAttemptToken: playbackAttempt.playbackAttemptToken }) });
         const renewed = (await responseJson<{ source: Source }>(response)).source;
         if (!current()) return;
         // Renew reporting authorization without replacing media that is already playing.
@@ -410,7 +418,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     const confirmAdvance = () => {
       if (!current() || attemptedRef.current.has(active.id) || !playbackAttempt.playbackAttemptToken || !successEvidence.advance(video.currentTime, video.paused, video.seeking)) return;
       const token = playbackAttempt.playbackAttemptToken;
-      void fetch('/api/playback/success', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: active.id, playbackAttemptToken: token }), signal: AbortSignal.timeout(8000) })
+      void playbackFetch('/api/playback/success', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: active.id, playbackAttemptToken: token }) })
         .then(response => responseJson<{ ok: boolean; restored: boolean }>(response)).then(result => {
           if (!current() || !result.ok || attemptedRef.current.has(active.id)) return;
           sourcesRef.current = sourcesRef.current.map(entry => entry.id === active.id ? { ...entry, health: 'healthy', playbackBlocked: false, playbackRetry: false } : entry);
@@ -423,7 +431,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
       if (!active.conversion && !bridgeAttemptRef.current.has(active.id)) { void prepareRef.current(Math.max(currentTimeRef.current, seekRef.current)); return; }
       if (active.conversion) {
         try {
-          const status = await fetch(`/api/playback/session/${active.conversion.sessionId}`, { signal: AbortSignal.timeout(8000) }).then(response => responseJson<{ status: string; classification?: string; error?: string }>(response));
+          const status = await playbackFetch(`/api/playback/session/${active.conversion.sessionId}`, {}).then(response => responseJson<{ status: string; classification?: string; error?: string }>(response));
           if (!current()) return;
           if (status.classification === 'source') { failureRef.current(status.error || reason); return; }
         } catch { /* A local conversion outage must not hide the upstream title. */ }
@@ -431,7 +439,34 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
       }
       if (current()) failureRef.current(reason);
     })(); };
-    const timeout = setTimeout(() => { if (!loaded) fail('The stream took too long to respond.'); }, active.conversion ? 65000 : 25000);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let playSequence = 0;
+    const rejectPlay = (reason: unknown, request: number) => {
+      if (!current() || request !== playSequence) return;
+      const rejection = playRejection(reason);
+      // load() cancels an older play promise during a source/seek transition.
+      if (rejection === 'interrupted') return;
+      if (rejection === 'unsupported') { fail('This format needs compatible playback.'); return; }
+      clearTimeout(timeout); timeout = undefined;
+      transferRef.current = null; playIntent.current = false;
+      setPlaying(false); setBuffering(false); setAwaitingPlay(true);
+      setNotice(rejection === 'gesture' ? 'Tap play to continue.' : 'Playback could not start. Tap play to try again.');
+    };
+    const requestPlay = () => {
+      if (!current()) return;
+      const request = ++playSequence;
+      // Keep this synchronous with the tap; awaiting metadata first can deadlock
+      // WebKit when it defers loading a newly selected source until play().
+      try { void video.play().catch(reason => rejectPlay(reason, request)); } catch (reason) { rejectPlay(reason, request); }
+    };
+    playRequestRef.current = requestPlay;
+    const startLoading = () => {
+      setAwaitingPlay(false);
+      if (!loaded && !timeout) timeout = setTimeout(() => { if (!loaded && !video.paused) fail('The stream took too long to respond.'); }, active.conversion ? 65000 : 30000);
+    };
+    // A phone may defer media loading until the viewer taps.
+    if (playIntent.current) startLoading();
+    video.addEventListener('play', startLoading);
     const restore = () => {
       if (!current() || video.readyState < 1) return;
       // Metadata is enough to show the paused player; buffering is timed separately after play.
@@ -445,7 +480,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
         seekRef.current = 0;
       }
       if (video.videoHeight > 0) setMeasuredQuality(`${video.videoHeight}p`);
-      if (playIntent.current) video.play().catch(() => { if (!current()) return; transferRef.current = null; playIntent.current = false; setPlaying(false); setBuffering(false); setNotice('Press play to continue.'); });
+      if (playIntent.current) { if (video.paused) requestPlay(); }
       else { transferRef.current = null; setBuffering(false); }
     };
     const nativeError = () => {
@@ -488,7 +523,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     video.addEventListener('pause', clearStall);
     void (async () => {
       try {
-        if (active.format === 'hls' || /\.m3u8(?:[?#]|$)/i.test(active.url!)) {
+        if ((active.format === 'hls' || /\.m3u8(?:[?#]|$)/i.test(active.url!)) && !deviceCapabilities(video).nativeHls) {
           const { default: Hls } = await import('hls.js');
           if (!current()) return;
           if (Hls.isSupported()) {
@@ -551,13 +586,18 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
         video.textTracks.addEventListener('addtrack', nativeTracks);
         video.src = active.url!;
         video.load();
+        // Conversion, language changes and next episodes replace src after the
+        // original tap. Try now; a fresh iOS gesture prompt must stay reachable.
+        if (playIntent.current) requestPlay();
       } catch (reason) { fail(reason instanceof Error ? reason.message : 'This stream could not be loaded.'); }
     })();
     return () => {
       disposed = true;
+      if (playRequestRef.current === requestPlay) playRequestRef.current = () => {};
       clearTimeout(timeout);
       clearInterval(renewTimer);
       clearStall();
+      video.removeEventListener('play', startLoading);
       video.removeEventListener('loadedmetadata', restore);
       video.removeEventListener('durationchange', restore);
       video.removeEventListener('loadeddata', loadedData);
@@ -583,8 +623,11 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
 
   useEffect(() => {
     setPipAvailable(document.pictureInPictureEnabled && !!videoRef.current?.requestPictureInPicture);
-    const updateFullscreen = () => setFullscreen(!!document.fullscreenElement);
+    const native = videoRef.current as ExtendedVideo | null;
+    const updateFullscreen = () => setFullscreen(!!document.fullscreenElement || !!native?.webkitDisplayingFullscreen);
     document.addEventListener('fullscreenchange', updateFullscreen);
+    native?.addEventListener('webkitbeginfullscreen', updateFullscreen);
+    native?.addEventListener('webkitendfullscreen', updateFullscreen);
     try {
       const preference = JSON.parse(localStorage.getItem('luma.player.preferences') ?? '{}');
       if (typeof preference.volume === 'number' && preference.volume >= 0 && preference.volume <= 1) setVolume(preference.volume);
@@ -594,7 +637,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
       preferredLanguageRef.current = preferred;
       setPreferredAudioLanguage(preferred);
     } catch { /* Fall back to sensible defaults. */ }
-    return () => document.removeEventListener('fullscreenchange', updateFullscreen);
+    return () => { document.removeEventListener('fullscreenchange', updateFullscreen); native?.removeEventListener('webkitbeginfullscreen', updateFullscreen); native?.removeEventListener('webkitendfullscreen', updateFullscreen); };
   }, []);
 
   useEffect(() => {
@@ -624,15 +667,17 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
-    if (!video || !activeRef.current || error) return;
+    if (!video || !activeRef.current || error || loading || sourceLoading) return;
     revealControls();
     if (video.paused) {
       playIntent.current = true;
       if (transferRef.current) transferRef.current.playing = true;
       setEnded(false);
-      video.play().catch(() => { setNotice('Playback could not start. Try another server.'); setBuffering(false); });
+      setAwaitingPlay(false);
+      // Call play synchronously from the tap to retain iOS playback permission.
+      playRequestRef.current();
     } else { playIntent.current = false; if (transferRef.current) transferRef.current.playing = false; video.pause(); }
-  }, [error, revealControls]);
+  }, [error, loading, sourceLoading, revealControls]);
 
   const seekTo = useCallback((time: number) => {
     if (metadataRef.current.title?.type === 'live') return;
@@ -655,10 +700,11 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
 
   const toggleFullscreen = useCallback(async () => {
     try {
+      const native = videoRef.current as ExtendedVideo | null;
       if (document.fullscreenElement) await document.exitFullscreen();
+      else if (native?.webkitDisplayingFullscreen && native.webkitExitFullscreen) native.webkitExitFullscreen();
       else if (frameRef.current?.requestFullscreen) await frameRef.current.requestFullscreen();
       else {
-        const native = videoRef.current as HTMLVideoElement & { webkitEnterFullscreen?: () => void };
         if (native?.webkitEnterFullscreen) native.webkitEnterFullscreen();
         else setNotice('Fullscreen is unavailable in this browser.');
       }
@@ -734,7 +780,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     playIntent.current = continuity.playing;
     videoRef.current?.pause();
     try {
-      const response = await fetch('/api/playback/attempt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: id, playbackAttemptToken: candidate.playbackAttemptToken }), signal: AbortSignal.timeout(8000) });
+      const response = await playbackFetch('/api/playback/attempt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceId: id, playbackAttemptToken: candidate.playbackAttemptToken }) });
       const fresh = (await responseJson<{ source: Source }>(response)).source;
       if (generation !== playbackGeneration.current) return;
       if (!fresh.url || !browserCompatible(fresh)) throw new Error('This server is not compatible with your browser.');
@@ -781,7 +827,7 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
     <main className="luma-watch" aria-label={title ? `Watching ${title.name}` : 'Video player'}>
       <div className={`player-frame ${visible ? 'chrome-visible' : ''} ${playing ? 'is-playing' : ''} ${title?.type === 'series' ? 'has-episodes' : ''}`} ref={frameRef} tabIndex={0} onMouseMove={revealControls} onTouchStart={revealControls} onFocus={revealControls}>
         <video ref={videoRef} className="player-video" playsInline preload="metadata" poster={title?.backdrop || title?.poster || undefined} onClick={togglePlay} onDoubleClick={() => void toggleFullscreen()}
-          onPlay={() => { setPlaying(true); playIntent.current = true; hasPlayedRef.current = true; revealControls(); }}
+          onPlay={() => { setAwaitingPlay(false); setPlaying(true); playIntent.current = true; hasPlayedRef.current = true; revealControls(); }}
           onPause={() => { setPlaying(false); saveProgress(true); }}
           onPlaying={() => { setBuffering(false); setPlaying(true); }}
           onWaiting={() => setBuffering(true)} onSeeking={() => setBuffering(true)} onSeeked={() => { setBuffering(false); saveProgress(true); }}
@@ -798,8 +844,8 @@ export default function Player({ titleId, initialEpisodeId }: { titleId: string;
           <span className="player-top-hint">YOUR FRONT ROW SEAT</span>
         </header>
 
-        {(loading || sourceLoading || buffering && !error) && <div className="player-loading" role="status"><LoaderCircle size={38} className="spin" /><span>{loading ? 'Finding your next escape' : sourceLoading ? 'Finding a playback server' : 'Loading your stream'}</span></div>}
-        {!loading && !sourceLoading && !buffering && !playing && !error && !ended && activeId && <button className="player-center-play" onClick={togglePlay} aria-label="Play video"><Play size={35} fill="currentColor" /></button>}
+        {(loading || sourceLoading || buffering && !awaitingPlay && !error) && <div className="player-loading" role="status"><LoaderCircle size={38} className="spin" /><span>{loading ? 'Finding your next escape' : sourceLoading ? 'Finding a playback server' : 'Loading your stream'}</span></div>}
+        {!loading && !sourceLoading && (!buffering || awaitingPlay) && !playing && !error && !ended && activeId && <button className="player-center-play" onClick={togglePlay} aria-label="Play video"><Play size={35} fill="currentColor" /></button>}
         {error && <div className="player-error" role="alert"><Wifi size={30} /><h1>{title ? 'A little interruption' : 'Title unavailable'}</h1><p>{error}</p><div className="player-error-actions"><button onClick={() => { saveProgress(true); if (activeRef.current && sourcesRef.current.some(entry => entry.id === activeRef.current)) void selectServer(activeRef.current); else setReload(value => value + 1); }}><RotateCcw size={16} /> Try again</button>{sources.length > 0 && <button className="secondary" onClick={() => togglePanel('servers')}>Choose a server</button>}<Link href={title?.type === 'live' ? '/?view=live' : '/'}>Back to browse</Link></div></div>}
         {notice && <div className="player-notice" role="status"><Info size={15} /><span>{notice}</span></div>}
         {skip && !error && <button className="player-skip-intro" onClick={() => seekTo(skip.end)}>{skip.label}<SkipForward size={17} /></button>}

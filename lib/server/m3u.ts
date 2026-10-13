@@ -4,7 +4,7 @@ import { validateSourceUrl } from './outbound';
 import { extractLanguageTags, normalizeLanguage } from '../languages';
 
 // Persisted in snapshot reports: identical bytes must be reprocessed after parser changes.
-export const M3U_IMPORT_VERSION = 9;
+export const M3U_IMPORT_VERSION = 10;
 
 export interface PlaylistEntry {
   name: string; title: string; normalized: string; year: number | null; type: ContentType;
@@ -146,7 +146,7 @@ export function cleanDisplayTitle(value: string, type: ContentType): string {
 export interface EpisodeDescriptor { title: string; season: number; episode: number; episodeName: string; }
 /** Explicit season/episode coordinates only: ordinary title digits never supply numbering. */
 export function parseEpisodeTitle(value: string): EpisodeDescriptor | null {
-  const markers = [...value.matchAll(/(?<![\p{L}\p{N}])(?:S(?:eason)?[\s._-]*(\d{1,2})[\s._:-]*(?:Episode|Ep|E)[\s._-]*(\d{1,3})|(\d{1,2})x(\d{1,3}))(?![\p{L}\p{N}])/giu)];
+  const markers = [...value.matchAll(/(?<![\p{L}\p{N}])(?:S(?:eason)?[\s.#:_-]*(\d{1,2})[\s._:-]*(?:Episode|Ep|E)[\s.#:_-]*(\d{1,3})|(\d{1,2})x(\d{1,3}))(?![\p{L}\p{N}])/giu)];
   if (markers.length !== 1) return null;
   const marker = markers[0], season = Number(marker[1] ?? marker[3]), episode = Number(marker[2] ?? marker[4]);
   let before = value.slice(0, marker.index).trim(), after = value.slice(marker.index! + marker[0].length).trim();
@@ -169,11 +169,14 @@ export function inferFormat(url: string): Source['format'] {
   if (/\.m3u8?$/.test(path)) return 'hls'; if (/\.mpd$/.test(path)) return 'dash'; if (/\.(mp4|m4v|mov)$/.test(path)) return 'mp4'; if (/\.webm$/.test(path)) return 'webm'; return 'unknown';
 }
 export function parseM3U(input: string): { entries: PlaylistEntry[]; errors: string[] } {
-  const lines = input.replace(/^\uFEFF/, '').split(/\r?\n/).map(x => x.trim());
-  if (!lines.find(x => x)?.startsWith('#EXTM3U')) throw new Error('Playlist must begin with #EXTM3U');
+  // Large provider lists already retain the input and parsed entries. Walk the
+  // lines without allocating two additional arrays of every line in the file.
+  function* lines() { let start = 0; for (;;) { const end = input.indexOf('\n', start); if (end < 0) { yield input.slice(start).trim(); return; } yield input.slice(start, end).trim(); start = end + 1; } }
+  let header = false, index = -1;
   const entries: PlaylistEntry[] = []; const errors: string[] = []; let pending: { attributes: Record<string, string>; name: string; line: number } | null = null; const identityCounts = new Map<string, number>(); const seenStreams = new Set<string>();
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]; if (!line) continue;
+  for (const line of lines()) {
+    index++; if (!line) continue;
+    if (!header) { if (!line.startsWith('#EXTM3U')) throw new Error('Playlist must begin with #EXTM3U'); header = true; }
     if (line.startsWith('#EXTINF:')) {
       if (pending) errors.push(`Line ${pending.line}: missing stream URL`);
       let quote: string | null = null; let delimiter = -1;
@@ -237,6 +240,7 @@ export function parseM3U(input: string): { entries: PlaylistEntry[]; errors: str
     const ambiguous = type === 'series' ? !episodic : type === 'live' ? false : categoryHeader || !year && explicitType !== 'movie' && pathType !== 'movie' && !/movie|film|vod/i.test(group);
     entries.push({ name, title, normalized, year, type, season, episode, episodeName: episodic?.episodeName || '', url, attributes, poster: attributes['tvg-logo'] || '', group, format: inferFormat(url), key: entryKey, ambiguous, language, languageExplicit, decorated: languageTags.decorated || identityTags.decorated, externalId });
   }
+  if (!header) throw new Error('Playlist must begin with #EXTM3U');
   if (pending) errors.push(`Line ${pending.line}: missing stream URL`);
   return { entries, errors: errors.slice(0, 100) };
 }

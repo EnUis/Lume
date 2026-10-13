@@ -7,27 +7,33 @@ import { enrichTitleMetadata, scheduleMetadataEnrichment } from '../lib/server/m
 import { heartbeatWorker } from '../lib/server/import-status';
 import { createWorkerLogger } from '../lib/server/worker-log';
 import { settleWorkerLanes, workerInterval } from '../lib/server/worker-lifecycle';
-import { createWorkerMaintenance, transientWorkerError, workerRetryDelay } from '../lib/server/worker-maintenance';
+import { connectWorkerDatabase, createWorkerMaintenance, transientWorkerError, workerRetryDelay } from '../lib/server/worker-maintenance';
 import { workerJobLanes } from '../lib/server/worker-capacity';
 import { createFirstTitleScheduler } from '../lib/server/health-scheduling';
 
 const logger = createWorkerLogger();
 
 async function main() {
-  const db = await database(); const owner = `${process.pid}:${id()}`; let stopping = false;
+  let stopping = false, stopMaintenance: (() => void) | undefined;
+  const stop = () => { stopping = true; stopMaintenance?.(); }; process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  const once = process.argv.includes('--once'); const lanes = workerJobLanes();
+  async function pause(milliseconds: number) {
+    const until = Date.now() + milliseconds;
+    while (!stopping && Date.now() < until) await new Promise(resolve => setTimeout(resolve, Math.min(1000, until - Date.now())));
+  }
+  const connected = await connectWorkerDatabase(database, { stopped: () => stopping, pause, once, report: error => logger.error('worker.database.delayed', error) })
+    .catch(error => { process.off('SIGINT', stop); process.off('SIGTERM', stop); throw error; });
+  if (!connected) { process.off('SIGINT', stop); process.off('SIGTERM', stop); logger.flush(true); return; }
+  const db = connected;
+  const owner = `${process.pid}:${id()}`;
   const firstTitles = createFirstTitleScheduler(db);
   const maintenance = createWorkerMaintenance([
     { name: 'checks', run: () => scheduleDueJobs(db) },
     { name: 'first-titles', run: () => firstTitles() },
     { name: 'metadata', run: () => scheduleMetadataEnrichment(db) },
   ], (name, error) => logger.error(`worker.schedule.${name}.failed`, error));
-  const stop = () => { stopping = true; maintenance.requestStop(); }; process.on('SIGINT', stop); process.on('SIGTERM', stop);
-  const once = process.argv.includes('--once'); const lanes = workerJobLanes();
+  stopMaintenance = () => maintenance.requestStop();
   let heartbeat: ReturnType<typeof workerInterval> | undefined;
-  async function pause(milliseconds: number) {
-    const until = Date.now() + milliseconds;
-    while (!stopping && Date.now() < until) await new Promise(resolve => setTimeout(resolve, Math.min(1000, until - Date.now())));
-  }
   async function next(types?: Array<'sync' | 'health' | 'metadata'>) {
     if (stopping) return false;
     const job = await leaseJob(db, owner, types); if (!job) return false;
@@ -76,7 +82,12 @@ async function main() {
     }
   } finally {
     stop(); process.off('SIGINT', stop); process.off('SIGTERM', stop);
-    try { await maintenance.stop(); await heartbeat?.stop(); logger.flush(true); await db.run('DELETE FROM worker_heartbeats WHERE owner=?', [owner]); }
+    try {
+      await maintenance.stop(); await heartbeat?.stop();
+      try { await db.run('DELETE FROM worker_heartbeats WHERE owner=?', [owner]); }
+      catch (error) { logger.error('worker.heartbeat.failed', error); }
+      logger.flush(true);
+    }
     finally { await db.close(); }
   }
 }

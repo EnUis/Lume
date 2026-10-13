@@ -3,6 +3,7 @@ import { safeFetch, type FetchResult, type SafeFetcher } from './outbound';
 import { sanitizeError } from './security';
 import { createDecipheriv } from 'node:crypto';
 import { probeMedia, MediaRuntimeError, type MediaProbe } from './media-runtime';
+import { healthCapacity, HealthCapacityError, type HealthCapacity } from './health-capacity';
 
 export interface HealthResult { ok: boolean; format: Source['format']; error: string | null; latencyMs: number; quality: string | null; retryable?: boolean; }
 function ensureOk(response: FetchResult) { if (![200, 206].includes(response.status)) throw new Error(`Upstream HTTP ${response.status}${response.status === 401 || response.status === 403 ? ' (authentication or authorization required)' : ''}`); }
@@ -185,9 +186,19 @@ async function dash(response: FetchResult, fetcher: SafeFetcher): Promise<string
   else throw new Error('DASH segment addressing is unsupported or missing');
   const height = attr(representation[1], 'height'); return height ? `${height}p` : null;
 }
-export async function verifyStream(url: string, expectedFormat: Source['format'] = 'unknown', fetcher: SafeFetcher = safeFetch, probe: (url: string) => Promise<MediaProbe> = probeMedia): Promise<HealthResult> {
+type StreamProbe = (url: string, options?: { timeoutMs?: number }) => Promise<MediaProbe>;
+export async function verifyStream(url: string, expectedFormat: Source['format'] = 'unknown', fetcher: SafeFetcher = safeFetch, probe: StreamProbe = probeMedia, capacity: HealthCapacity = healthCapacity): Promise<HealthResult> {
+  let release: (() => void) | undefined;
+  try {
+    release = await capacity.acquireOrigin(url);
+    return await verifyActiveStream(url, expectedFormat, fetcher, probe, capacity);
+  } catch (error) {
+    return { ok: false, format: expectedFormat, error: sanitizeError(error), latencyMs: 0, quality: null, ...(error instanceof HealthCapacityError ? { retryable: true } : {}) };
+  } finally { release?.(); }
+}
+async function verifyActiveStream(url: string, expectedFormat: Source['format'], fetcher: SafeFetcher, probe: StreamProbe, capacity: HealthCapacity): Promise<HealthResult> {
   const started = Date.now(); let format = expectedFormat;
-  let requests = 0; const deadline = started + 30000;
+  let requests = 0; let deadline = started + 30000; let capacityWaitMs = 0;
   const boundedFetcher: SafeFetcher = async (value, options = {}) => {
     if (++requests > 20) throw new Error('Stream verification request limit exceeded');
     const remaining = deadline - Date.now(); if (remaining <= 0) throw new Error('Stream verification timeout');
@@ -224,11 +235,23 @@ export async function verifyStream(url: string, expectedFormat: Source['format']
       }
       // Raw transport streams also need remuxing/transcoding for browser playback.
       conversion ||= response.body[0] === 0x47 && response.body[188] === 0x47;
-      if (conversion) { format = 'unknown'; const media = await probe(response.url); quality = media.height ? `${media.height}p` : null; }
+      if (conversion) {
+        format = 'unknown';
+        const queued = Date.now();
+        const release = await capacity.acquireProbe();
+        const waited = Math.max(0, Date.now() - queued);
+        capacityWaitMs += waited; deadline += waited;
+        try {
+          const remaining = deadline - Date.now(); if (remaining <= 0) throw new Error('Stream verification timeout');
+          const media = await probe(response.url, { timeoutMs: remaining });
+          if (Date.now() > deadline) throw new Error('Stream verification timeout');
+          quality = media.height ? `${media.height}p` : null;
+        } finally { release(); }
+      }
       else format = isEbml(response.body) ? 'webm' : 'mp4';
     }
-    return { ok: true, format, error: null, latencyMs: Date.now() - started, quality };
-  } catch (error) { return { ok: false, format, error: sanitizeError(error), latencyMs: Date.now() - started, quality: null, ...(error instanceof MediaRuntimeError && error.classification !== 'source' ? { retryable: true } : {}) }; }
+    return { ok: true, format, error: null, latencyMs: Math.max(0, Date.now() - started - capacityWaitMs), quality };
+  } catch (error) { return { ok: false, format, error: sanitizeError(error), latencyMs: Math.max(0, Date.now() - started - capacityWaitMs), quality: null, ...(error instanceof HealthCapacityError || error instanceof MediaRuntimeError && error.classification !== 'source' ? { retryable: true } : {}) }; }
 }
 export function nextHealth(_previous: string, _failures: number, ok: boolean, _threshold?: number) {
   return ok ? 'healthy' : 'unavailable';

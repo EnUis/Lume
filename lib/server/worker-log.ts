@@ -1,4 +1,5 @@
 import { sanitizeError } from './security';
+import { databaseConnectionFailure } from './database-errors';
 
 type JobReference = { id: string; type: string };
 type LogOptions = { level?: string; now?: () => number; output?: (line: string) => void; error?: (line: string) => void };
@@ -12,6 +13,7 @@ export function workerError(error: unknown) {
   // Do not print payloads, provider URLs, connection strings or credential headers,
   // including their JSON/colon forms. Preserve the useful reason for the failure.
   return sanitizeError(message
+    .replace(/\bgetaddrinfo (ENOTFOUND|EAI_AGAIN)\s+[^\s]+/gi, 'Database address lookup failed ($1)')
     .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, '[redacted source]')
     .replace(/\b(?:Bearer|Basic)\s+[a-z\d._~+\/-]+=*/gi, '[redacted credentials]')
     .replace(/\b(password|passwd|pwd|token|api[-_ ]?key|secret|authorization|cookie|session)\b["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1=[redacted]')
@@ -43,8 +45,14 @@ export function createWorkerLogger(options: LogOptions = {}) {
     }
   }
   function failure(event: string, error: unknown, job?: JobReference, fatal = false) {
-    const message = workerError(error); const time = now();
+    let message = workerError(error); const time = now();
     if (diagnostic) { stderr(JSON.stringify({ event, ...(job ? { jobId: workerError(job.id), type: workerError(job.type) } : {}), error: message, time })); return; }
+    if (databaseConnectionFailure(error)) {
+      // All affected consumers share one outage notice instead of flooding the
+      // terminal with heartbeat, claim, job, and lease errors for the same outage.
+      event = 'worker.database.delayed'; job = undefined; fatal = false;
+      message = 'Database connection is temporarily unavailable. Background work will retry automatically.';
+    }
     if (!fatal && event === 'job.failed' && job && providerAccessDenied(job.type, message)) return;
     const state: RepeatedFailure = { event, message, jobType: job?.type, since: time, repeated: 0 };
     if (fatal) { notice(state); return; }

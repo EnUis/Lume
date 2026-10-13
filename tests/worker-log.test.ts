@@ -10,6 +10,18 @@ function capture(level = 'normal') {
 }
 
 describe('quiet worker logging', () => {
+  it('groups one database outage across all consumers without disclosing its hostname', () => {
+    const { logger, errors, advance } = capture();
+    const dns = Object.assign(new Error('getaddrinfo ENOTFOUND private-database.example'), { code: 'ENOTFOUND' });
+    logger.error('worker.heartbeat.failed', dns);
+    logger.failed({ id: 'stream', type: 'health' }, dns);
+    logger.error('worker.consumer.delayed', new Error('Connection terminated unexpectedly'));
+    logger.fatal(dns);
+    expect(errors).toHaveLength(1); expect(errors[0]).toContain('retry automatically');
+    expect(errors[0]).not.toContain('private-database');
+    advance(60000); logger.flush(); expect(errors).toHaveLength(2); expect(errors[1]).toContain('3 repeated failures');
+    expect(workerError(dns)).toBe('Database address lookup failed (ENOTFOUND)');
+  });
   it('keeps all ordinary completions quiet, including failed health verification outcomes', () => {
     const { logger, output, errors } = capture();
     logger.completed({ id: 'check-1', type: 'health' }, { ok: true, health: 'healthy', format: 'mp4' });

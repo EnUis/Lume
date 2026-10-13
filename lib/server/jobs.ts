@@ -19,6 +19,30 @@ export async function enqueue(db: DB, type: 'sync' | 'health' | 'metadata', payl
   return jobId;
 }
 export async function leaseJob(db: DB, owner: string, types?: Array<'sync' | 'health' | 'metadata'>): Promise<Row | null> {
+  if (db.dialect === 'postgres') {
+    const now = Date.now(), values: unknown[] = [now, now];
+    const requestedTypes = types?.length ? [...new Set(types)].sort() : [undefined];
+    const heads: string[] = [];
+    for (const type of requestedTypes) for (const status of ['queued', 'running']) {
+      const condition = status === 'queued' ? 'run_after<=?' : 'lease_until<?';
+      heads.push(`head_${heads.length} AS MATERIALIZED (SELECT id,run_after,created_at FROM jobs WHERE status='${status}'${type ? ' AND type=?' : ''} AND ${condition} AND attempts<max_attempts ORDER BY run_after,created_at LIMIT 1 FOR UPDATE SKIP LOCKED)`);
+      values.push(...(type ? [type, now] : [now]));
+    }
+    values.push(owner, now + 120000, now, now);
+    // One atomic statement replaces BEGIN, several queue reads, UPDATE, reread
+    // and COMMIT. Each queue head still uses its ordered partial index, and
+    // SKIP LOCKED lets independent health lanes claim different jobs.
+    return await db.get(`WITH exhausted AS (
+      UPDATE jobs SET status='failed',completed_at=?,error='Worker lease expired after maximum attempts',lease_owner=NULL,lease_until=NULL
+      WHERE id IN (SELECT id FROM jobs WHERE status='running' AND lease_until<? AND attempts>=max_attempts ORDER BY lease_until LIMIT 100 FOR UPDATE SKIP LOCKED)
+      RETURNING id
+    ), ${heads.join(',')}, candidate AS MATERIALIZED (
+      SELECT id FROM (${heads.map((_head, index) => `SELECT id,run_after,created_at FROM head_${index}`).join(' UNION ALL ')}) queue_heads ORDER BY run_after,created_at,id LIMIT 1
+    ) UPDATE jobs j SET status='running',lease_owner=?,lease_until=?,attempts=j.attempts+1
+      FROM candidate WHERE j.id=candidate.id AND j.attempts<j.max_attempts
+        AND (j.status='queued' AND j.run_after<=? OR j.status='running' AND j.lease_until<?)
+      RETURNING j.*`, values) || null;
+  }
   return db.transaction(async tx => {
     const now = Date.now();
     // Expired leases can be reclaimed after crashed workers; terminal attempts are surfaced.
@@ -67,7 +91,9 @@ export async function scheduleDueJobs(db: DB) {
   // Apply retry backoff before LIMIT so cooling or already queued sources cannot
   // monopolize the bounded batch. Existing due/active-dedupe indexes serve this.
   const retryInterval = `CASE WHEN s.health='healthy' THEN ${interval} ${Array.from({ length: 6 }, (_, n) => `WHEN s.failures<=${n + 1} THEN ${Math.min(interval, 300000 * 2 ** n)}`).join(' ')} ELSE ${Math.min(interval, 19200000)} END`;
-  const sources = await db.all(`SELECT s.id FROM sources s LEFT JOIN playlists p ON p.id=s.playlist_id WHERE s.enabled=1 AND s.removed=0 AND (s.playlist_id IS NULL OR p.enabled=1) AND (s.last_checked IS NULL OR s.last_checked<? AND s.last_checked<=? - (${retryInterval})) AND NOT EXISTS(SELECT 1 FROM jobs active WHERE active.dedupe_key='health:' || s.id AND active.status IN ('queued','running') AND (active.status='running' OR active.attempts<active.max_attempts)) ORDER BY s.last_checked LIMIT 100`, [now - 300000, now]);
+  // PostgreSQL otherwise infers the untyped subtraction parameter as int4 from
+  // the CASE constants, overflowing on a millisecond Unix timestamp.
+  const sources = await db.all(`SELECT s.id FROM sources s LEFT JOIN playlists p ON p.id=s.playlist_id WHERE s.enabled=1 AND s.removed=0 AND (s.playlist_id IS NULL OR p.enabled=1) AND (s.last_checked IS NULL OR s.last_checked<? AND s.last_checked<=CAST(? AS BIGINT) - (${retryInterval})) AND NOT EXISTS(SELECT 1 FROM jobs active WHERE active.dedupe_key='health:' || s.id AND active.status IN ('queued','running') AND (active.status='running' OR active.attempts<active.max_attempts)) ORDER BY s.last_checked LIMIT 100`, [now - 300000, now]);
   let healthQueued = 0;
   if (sources.length) {
     await db.transaction(async tx => {

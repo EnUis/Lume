@@ -1,7 +1,27 @@
 import { describe, expect, it } from 'vitest';
-import { createWorkerMaintenance, transientWorkerError, workerRetryDelay } from '../lib/server/worker-maintenance';
+import { connectWorkerDatabase, createWorkerMaintenance, transientWorkerError, workerRetryDelay } from '../lib/server/worker-maintenance';
 
 describe('independent worker maintenance', () => {
+  it('reconnects after DNS/socket failures with bounded backoff and accepts shutdown while disconnected', async () => {
+    let attempts = 0; const delays: number[] = [], errors: unknown[] = [];
+    const connected = await connectWorkerDatabase(async () => {
+      attempts++;
+      if (attempts === 1) throw Object.assign(new Error('DNS failure'), { code: 'ENOTFOUND' });
+      if (attempts < 4) throw new Error('Connection terminated unexpectedly');
+      return 'connected';
+    }, { stopped: () => false, pause: async delay => { delays.push(delay); }, report: error => errors.push(error) });
+    expect(connected).toBe('connected'); expect(delays).toEqual([1000, 2000, 4000]); expect(errors).toHaveLength(3);
+    let stopped = false;
+    expect(await connectWorkerDatabase(async () => { throw Object.assign(new Error('DNS failure'), { code: 'EAI_AGAIN' }); }, { stopped: () => stopped, pause: async () => { stopped = true; }, report: () => {} })).toBeNull();
+    await expect(connectWorkerDatabase(async () => { throw new Error('Bad schema'); }, { stopped: () => false, pause: async () => {}, report: () => {} })).rejects.toThrow('Bad schema');
+  });
+
+  it('keeps one-shot verification failures explicit and recognizes pg errors without error codes', async () => {
+    const failure = new Error('Connection terminated due to connection timeout');
+    expect(transientWorkerError(failure)).toBe(true);
+    await expect(connectWorkerDatabase(async () => { throw failure; }, { stopped: () => false, once: true, pause: async () => { throw new Error('Must not retry'); }, report: () => {} })).rejects.toBe(failure);
+    for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH']) expect(transientWorkerError({ code })).toBe(true);
+  });
   it('backs off a timed-out stage while healthy scheduling and existing consumers continue', async () => {
     let time = 0, checks = 0, metadata = 0, consumed = 0;
     const errors: string[] = [], timeout = Object.assign(new Error('Statement timed out'), { code: '57014' });

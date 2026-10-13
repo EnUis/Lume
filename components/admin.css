@@ -161,3 +161,20 @@
 .admin-visibility-explanation .admin-stream-note { color: #819074; font-size: 11px; }
 
 .admin-stream-activity { color: #bacc9f; font-size: 12px; line-height: 1.7; margin: 7px 0 0; }
+
+@media(max-width:760px){
+  .admin-overlay{padding:max(12px,env(safe-area-inset-top)) max(12px,env(safe-area-inset-right)) max(12px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left))}
+  .admin-dialog{max-height:calc(100dvh - max(12px,env(safe-area-inset-top)) - max(12px,env(safe-area-inset-bottom)));overscroll-behavior:contain}
+  .admin-field input,.admin-field select,.admin-field textarea,.admin-search input,.admin-filters select{font-size:16px;min-height:44px;min-width:0}
+  .admin-button,.admin-button.compact,.admin-text-button,.admin-icon,.admin-pagination button,.admin-row-actions button{min-height:44px}
+  .admin-icon{min-width:44px}
+  .admin-import-row>.admin-icon{width:44px;height:44px}
+  .admin-file-name{overflow-wrap:anywhere}
+  .admin-file-name button{min-width:44px;min-height:44px}
+  .admin-editor-tabs{overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+  .admin-editor-tabs button{min-height:44px;font-size:12px}
+  .admin-dialog-actions{flex-wrap:wrap}
+  .admin-upload{min-height:44px}
+  .admin-table-wrap{overscroll-behavior-x:contain}
+}
+@media(max-width:650px){.admin-sidebar nav button{min-height:44px}.admin-sidebar{padding-top:max(13px,env(safe-area-inset-top))}.admin-topbar{height:auto;min-height:64px;gap:15px;flex-wrap:wrap;padding-block:12px}}

@@ -1,3 +1,5 @@
+import { databaseConnectionFailure } from './database-errors';
+
 interface MaintenanceTask { name: string; run: () => Promise<unknown>; }
 interface MaintenanceOptions { now?: () => number; intervalMs?: number; retryMs?: number; maxRetryMs?: number; }
 
@@ -30,6 +32,7 @@ export function createWorkerMaintenance(tasks: MaintenanceTask[], report: (name:
 
 /** Retry temporary database trouble, while genuine code/schema errors remain visible. */
 export function transientWorkerError(error: unknown): boolean {
+  if (databaseConnectionFailure(error)) return true;
   const seen = new Set<unknown>();
   while (error && typeof error === 'object' && !seen.has(error)) {
     seen.add(error);
@@ -41,3 +44,14 @@ export function transientWorkerError(error: unknown): boolean {
 }
 
 export function workerRetryDelay(failures: number) { return Math.min(30000, 1000 * 2 ** Math.min(5, Math.max(0, failures - 1))); }
+export async function connectWorkerDatabase<T>(open: () => Promise<T>, options: { stopped: () => boolean; pause: (milliseconds: number) => Promise<void>; report: (error: unknown) => void; once?: boolean }): Promise<T | null> {
+  let failures = 0;
+  while (!options.stopped()) {
+    try { return await open(); }
+    catch (error) {
+      if (options.once || !transientWorkerError(error)) throw error;
+      options.report(error); await options.pause(workerRetryDelay(++failures));
+    }
+  }
+  return null;
+}

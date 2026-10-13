@@ -2,6 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { hash } from './security';
 import { validateSourceUrl } from './outbound';
+import { MediaHlsWindow } from './media-hls';
+import { mediaRateArguments, MEDIA_RATE_LIMITS } from './media-encoding';
 
 export type MediaFailure = 'source' | 'capacity' | 'config' | 'transient';
 export class MediaRuntimeError extends Error {
@@ -12,17 +14,19 @@ export interface MediaProbe { duration: number | null; videoIndex: number; video
 interface MediaSession {
   id: string; sourceId: string; url: string; urlHash: string; viewer: string; startAt: number; audioTrack?: number; live?: boolean; probe: MediaProbe;
   touched: number; created: number; process?: ChildProcessWithoutNullStreams; status: 'ready' | 'playing' | 'complete' | 'failed' | 'expired';
-  classification?: MediaFailure; error?: string; bytes: number; sequence: number;
+  classification?: MediaFailure; error?: string; bytes: number; sequence: number; hls?: MediaHlsWindow;
 }
 type Runtime = { sessions: Map<string, MediaSession>; probes: Map<string, { until: number; result: MediaProbe }>; probing: number; timer?: ReturnType<typeof setInterval> };
 const globals = globalThis as typeof globalThis & { __lumeMediaRuntime?: Runtime };
 const state: Runtime = globals.__lumeMediaRuntime ||= { sessions: new Map(), probes: new Map(), probing: 0 };
 const binary = (kind: 'FFMPEG' | 'FFPROBE') => process.env[`${kind}_PATH`] || kind.toLowerCase();
-const inputOptions = (url: string) => ['-protocol_whitelist', 'http,https,tcp,tls,crypto,httpproxy', ...(new URL(url).protocol === 'https:' ? ['-tls_verify', '1'] : []), '-rw_timeout', '15000000', '-analyzeduration', '5000000', '-probesize', '5000000'];
+const inputOptions = (url: string, timeoutMs = 15000) => ['-protocol_whitelist', 'http,https,tcp,tls,crypto,httpproxy', ...(new URL(url).protocol === 'https:' ? ['-tls_verify', '1'] : []), '-rw_timeout', String(Math.min(15000, timeoutMs) * 1000), '-analyzeduration', '5000000', '-probesize', '5000000'];
 const allowed = (url: string) => validateSourceUrl(url).toString();
-function running() { return [...state.sessions.values()].filter(session => session.process).length; }
+// Completed HLS encoders still own buffered fragments until release/expiry.
+// Count those windows too so rapid short videos cannot accumulate 100 × 32 MiB.
+function running() { return [...state.sessions.values()].filter(session => session.process || session.hls).length; }
 function maximum() { return Math.max(1, Math.min(8, Number(process.env.MEDIA_MAX_PROCESSES) || 2)); }
-function stop(session: MediaSession) { const child = session.process; session.process = undefined; if (child && child.exitCode === null) child.kill('SIGKILL'); }
+function stop(session: MediaSession, preserveHls = false) { if (!preserveHls) { const hls = session.hls; session.hls = undefined; hls?.stop(); } const child = session.process; session.process = undefined; if (child && child.exitCode === null) child.kill('SIGKILL'); }
 function fail(session: MediaSession, classification: MediaFailure, error: string) { session.classification = classification; session.error = error; session.status = 'failed'; stop(session); }
 if (!state.timer) {
   state.timer = setInterval(() => {
@@ -38,18 +42,19 @@ if (!state.timer) {
 }
 
 /** Only administrator-saved HTTP(S) sources reach this module; never accept a browser URL. */
-export async function probeMedia(value: string): Promise<MediaProbe> {
+export async function probeMedia(value: string, options: { timeoutMs?: number } = {}): Promise<MediaProbe> {
   if (process.env.MEDIA_CONVERSION === 'false') throw new MediaRuntimeError('config', 'Video conversion is disabled on this server.');
   const url = allowed(value), key = hash(url), cached = state.probes.get(key);
   if (cached && cached.until > Date.now()) return cached.result;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1, Math.min(30000, Math.floor(options.timeoutMs!))) : 30000;
   if (state.probing >= 4) throw new MediaRuntimeError('capacity', 'The video server is busy. Please try again shortly.');
   state.probing++;
   try {
     const output = await new Promise<string>((resolve, reject) => {
-      const child = spawn(binary('FFPROBE'), ['-v', 'error', ...inputOptions(url), '-show_entries', 'format=duration:stream=index,codec_type,codec_name,width,height,duration,channels:stream_tags=language,title:stream_disposition=default,attached_pic', '-of', 'json', url], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = spawn(binary('FFPROBE'), ['-v', 'error', ...inputOptions(url, timeoutMs), '-show_entries', 'format=duration:stream=index,codec_type,codec_name,width,height,duration,channels:stream_tags=language,title:stream_disposition=default,attached_pic', '-of', 'json', url], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
       child.stdin.end(); let chunks: Buffer[] = [], size = 0, settled = false;
       const finish = (error?: Error) => { if (settled) return; settled = true; clearTimeout(timer); if (child.exitCode === null) child.kill('SIGKILL'); error ? reject(error) : resolve(Buffer.concat(chunks).toString('utf8')); };
-      const timer = setTimeout(() => finish(new MediaRuntimeError('source', 'The video server did not respond while opening the file.', 'upstream_timeout')), 30000); timer.unref();
+      const timer = setTimeout(() => finish(new MediaRuntimeError('source', 'The video server did not respond while opening the file.', 'upstream_timeout')), timeoutMs); timer.unref();
       child.stdout.on('data', (chunk: Buffer) => { size += chunk.length; if (size > 524288) finish(new MediaRuntimeError('source', 'This file has excessive or invalid video metadata.')); else chunks.push(chunk); });
       child.stderr.resume(); // Never expose private upstream addresses or credentials.
       child.on('error', () => finish(new MediaRuntimeError('config', 'FFmpeg and ffprobe must be installed on the video server.', 'media_tools_missing')));
@@ -89,21 +94,30 @@ export function mediaSessionStatus(id: string, viewer: string) {
 }
 export function stopMediaSession(id: string, viewer: string) { const session = state.sessions.get(id); if (session?.viewer === viewer) { stop(session); state.sessions.delete(id); } }
 
+/** Native HLS devices request short, authorized same-origin fragments. */
+export async function mediaHlsResource(id: string, viewer: string, name: string, query = '') {
+  const session = sessionFor(id, viewer); session.touched = Date.now();
+  if (!session.hls && !session.process && running() >= maximum()) throw new MediaRuntimeError('capacity', 'The video server is busy. Please try again shortly.', 'media_capacity');
+  session.hls ||= new MediaHlsWindow(signal => streamMedia(id, viewer, signal, true));
+  try { return await session.hls.resource(name, query); }
+  catch (error) { if (error instanceof MediaRuntimeError) throw error; throw new MediaRuntimeError('transient', 'This video segment is unavailable. Press retry to continue.', 'media_segment_unavailable'); }
+}
+
 /** Stream fragmented H.264/AAC MP4 with bounded memory and no full-file download/cache. */
-export async function streamMedia(id: string, viewer: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
+export async function streamMedia(id: string, viewer: string, signal: AbortSignal, hls = false): Promise<ReadableStream<Uint8Array>> {
   const session = sessionFor(id, viewer);
   if (signal.aborted) throw new MediaRuntimeError('transient', 'Playback request was canceled.');
   if (session.status === 'failed') throw new MediaRuntimeError(session.classification || 'source', session.error || 'This video could not start.');
-  if (running() >= maximum() && !session.process) throw new MediaRuntimeError('capacity', 'The video server is busy. Please try again shortly.', 'media_capacity');
-  stop(session); const sequence = ++session.sequence;
+  if (running() >= maximum() && !session.process && !session.hls) throw new MediaRuntimeError('capacity', 'The video server is busy. Please try again shortly.', 'media_capacity');
+  stop(session, hls); const sequence = ++session.sequence;
   const track = session.audioTrack ?? session.probe.audioTracks.find(track => track.default)?.index ?? session.probe.audioTracks[0]?.index;
-  const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', ...inputOptions(session.url), '-threads', '2', '-readrate', '1.3', ...(session.startAt ? ['-ss', session.startAt.toFixed(3)] : []), '-i', session.url, '-map', `0:${session.probe.videoIndex}`, ...(track === undefined ? ['-an'] : ['-map', `0:${track}`, '-c:a', 'aac', '-ac', '2', '-b:a', '160k']), '-sn', '-dn', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2', '-vf', 'scale=trunc(min(1280\\,iw)/2)*2:-2', '-pix_fmt', 'yuv420p', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0', '-avoid_negative_ts', 'make_zero', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '2000000', '-f', 'mp4', 'pipe:1'];
+  const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', ...inputOptions(session.url), '-threads', '2', '-readrate', '1.3', ...(session.startAt ? ['-ss', session.startAt.toFixed(3)] : []), '-i', session.url, '-map', `0:${session.probe.videoIndex}`, ...(track === undefined ? ['-an'] : ['-map', `0:${track}`, '-c:a', 'aac', '-ac', '2', '-b:a', String(MEDIA_RATE_LIMITS.audio)]), '-sn', '-dn', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', ...mediaRateArguments, '-threads', '2', '-vf', 'scale=trunc(min(1280\\,iw)/2)*2:-2', '-pix_fmt', 'yuv420p', '-r', '24', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0', '-video_track_timescale', '24000', '-avoid_negative_ts', 'make_zero', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
   const child = spawn(binary('FFMPEG'), args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); child.stdin.end();
   session.process = child; session.status = 'playing'; session.touched = Date.now(); session.bytes = 0;
   const current = () => session.sequence === sequence;
   let settled = false, closed = false, controller: ReadableStreamDefaultController<Uint8Array> | undefined, startupResolve: (value: ReadableStream<Uint8Array>) => void, startupReject: (error: Error) => void;
   const startup = new Promise<ReadableStream<Uint8Array>>((resolve, reject) => { startupResolve = resolve; startupReject = reject; });
-  const abort = () => { if (current()) { stop(session); session.status = 'ready'; } end(new MediaRuntimeError('transient', 'Playback request was canceled.', 'media_canceled')); };
+  const abort = () => { if (current()) { stop(session); if (!['failed', 'expired'].includes(session.status)) session.status = 'ready'; } end(new MediaRuntimeError('transient', 'Playback request was canceled.', 'media_canceled')); };
   const end = (error?: MediaRuntimeError) => {
     if (closed) return; closed = true; clearTimeout(timer); signal.removeEventListener('abort', abort);
     if (!settled) { settled = true; startupReject(error || new MediaRuntimeError('source', 'The video did not produce playable frames.')); }
