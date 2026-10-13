@@ -11,7 +11,7 @@ WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0 PORT=3000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates socat \
+    ffmpeg ca-certificates socat ncat \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 1001 luma \
     && usermod -aG 1000 luma \
