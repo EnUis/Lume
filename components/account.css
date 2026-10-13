@@ -36,3 +36,28 @@
 .account-toast{position:fixed;z-index:1500;bottom:25px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:10px;background:#d6ef80;color:#233116;border-radius:9px;padding:15px 21px;box-shadow:0 5px 30px #0004;font-size:12px;max-width:90vw}.account-loading{display:flex;justify-content:center;align-items:center;gap:12px;color:#9bb77b;font-size:12px;padding:90px 20px}
 @media(max-width:1100px){.account-main{padding:55px 35px}.account-heading h1{font-size:32px}.account-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.account-card-grid.posters{grid-template-columns:repeat(4,minmax(0,1fr))}.account-member{display:none}}
 @media(max-width:650px){.account-main{padding:35px 20px}.account-heading{flex-wrap:wrap;gap:18px;margin-bottom:25px}.account-heading h1{font-size:29px;letter-spacing:-1px}.account-heading p{font-size:12px}.account-profile{padding:18px;gap:12px}.account-profile h2{font-size:13px}.account-profile p{font-size:10px}.account-avatar{width:38px;height:38px;font-size:17px;flex-shrink:0}.account-admin-link{font-size:9px;margin-left:auto;white-space:nowrap}.account-tabs{gap:22px;margin-bottom:25px}.account-tabs button{font-size:10px;gap:6px}.account-tabs button svg{width:13px}.account-card-grid{grid-template-columns:1fr;gap:27px}.account-card-grid.posters{grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 15px}.account-guest-note{padding:17px;gap:11px}.account-guest-note p{font-size:10px}.account-empty{padding:45px 12px 60px}.account-empty h2{font-size:22px}.account-empty p{font-size:11px}.account-history>div{padding:17px 14px;gap:10px;flex-wrap:wrap}.account-history time{font-size:8px}.account-history-icon{width:32px;height:32px}.account-history h3{font-size:11px}.account-history p{font-size:9px}.account-history a{width:20px;height:20px;margin-left:0}.account-preferences{padding:0 18px}.account-preference-row{gap:20px;align-items:flex-start}.account-preference-row h3{font-size:12px}.account-preference-row p{font-size:10px}.account-preference-row select{font-size:10px;padding:8px;min-width:100px}.account-preference-footer{padding:18px 0;gap:15px}.account-preference-footer>span{font-size:8px}.account-button{font-size:10px;padding:11px 13px}.account-migration{padding:18px}.account-migration>label{font-size:10px}.account-migration>.account-button{margin-left:0}.account-toast{font-size:11px;padding:13px 17px;width:max-content;max-width:90vw}.account-unavailable{min-height:180px;padding:20px}}
+
+.account-main{padding-top:144px}
+.account-profile>div{min-width:0}
+.account-profile p{overflow-wrap:anywhere}
+@media(max-width:1100px){.account-main{padding-top:126px}}
+@media(max-width:760px){
+  .account-main{padding:calc(116px + env(safe-area-inset-top)) max(6%,env(safe-area-inset-right)) 48px max(6%,env(safe-area-inset-left))}
+  .account-heading h1{overflow-wrap:anywhere}
+  .account-heading p,.account-profile p{font-size:12px}
+  .account-profile{flex-wrap:wrap}
+  .account-profile>div:not(.account-avatar){flex:1}
+  .account-admin-link{min-height:44px;margin-left:0;font-size:12px}
+  .account-button,.account-tabs button,.account-resume,.account-favorite-button,.account-clear-history{min-height:44px;font-size:12px}
+  .account-tabs{gap:24px;scrollbar-width:none}
+  .account-tabs button svg{width:16px;height:16px}
+  .account-preference-row{flex-wrap:wrap;gap:15px}
+  .account-preference-row h3{font-size:14px}
+  .account-preference-row p,.account-guest-note p{font-size:12px}
+  .account-preference-row select{font-size:16px;min-height:46px}
+  .account-preference-footer{flex-wrap:wrap}
+  .account-preference-footer>span{font-size:11px;line-height:1.6}
+  .account-history a{width:44px;height:44px}
+  .account-history h3{font-size:13px}
+  .account-history p,.account-history time{font-size:11px}
+}

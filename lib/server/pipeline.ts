@@ -5,8 +5,9 @@ import { decrypt, encrypt, hash, id, sanitizeError } from './security';
 import { enqueue } from './jobs';
 import { nextHealth, verifyStream } from './health';
 import { normalizeLanguage } from '../languages';
-import { lockPlaybackUrl } from './playback-state';
 import { PlaylistFetchError } from './playlist-errors';
+import { genericPlaylistArtwork } from './catalog-artwork';
+import { importPlaybackBlocks, insertImportRows, lockImportUrls } from './import-batches';
 
 export async function createTitle(db: DB, data: { name: string; type?: string; year?: number | null; poster?: string; genres?: string[]; published?: boolean }) {
   const titleId = id(); const now = Date.now();
@@ -176,10 +177,6 @@ function importSourceKeys(urlHash: string, language: unknown, originalName: unkn
   const code = normalizeLanguage(language); const name = typeof originalName === 'string' ? originalName.trim().replace(/\s+/g, ' ') : '';
   return [code && name ? JSON.stringify([urlHash, code, name]) : null, name ? JSON.stringify([urlHash, name]) : null, code ? JSON.stringify([urlHash, code]) : null, urlHash];
 }
-/** A new reference to an already failed URL must retain its browser playback block. */
-async function playbackBlockForUrl(db: DB, urlHash: string) {
-  return db.get('SELECT error,playback_blocked_at,last_failure,failures FROM sources WHERE url_hash=? AND playback_blocked=1 ORDER BY playback_blocked_at DESC NULLS LAST LIMIT 1', [urlHash]);
-}
 export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: SafeFetcher = safeFetch, restoreContent?: string, options: ImportOptions = {}) {
   const playlist = await db.get('SELECT * FROM playlists WHERE id=?', [playlistId]); if (!playlist) throw new Error('Playlist no longer exists');
   if (!playlist.enabled && !restoreContent) return { skipped: true, reason: 'Playlist disabled' };
@@ -204,16 +201,26 @@ export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: S
       if (fetched.status !== 200) throw new PlaylistFetchError(fetched.status, fetched.headers['retry-after']);
       if (fetched.truncated) throw new Error('Playlist download was incomplete'); content = fetched.body.toString('utf8');
     } else content = decrypt(playlist.content_encrypted || '');
+    const contentHash = hash(content); const previousVersion = await db.get('SELECT content_hash,report FROM playlist_versions WHERE playlist_id=? ORDER BY created_at DESC LIMIT 1', [playlistId]);
+    let previousImportVersion = 0; let previousStarterVersion = 0; let previousReport: Record<string, any> = {};
+    try { previousReport = JSON.parse(previousVersion?.report || '{}'); previousImportVersion = previousReport.importVersion || 0; previousStarterVersion = previousReport.starterVerificationVersion || 0; } catch { /* Older or corrupt reports require reprocessing. */ }
+    if (!(await configurationCurrent())) return superseded();
+    // The activated snapshot proves these exact bytes were fully parsed and
+    // committed by this parser. Skip parsing/index construction on routine refresh.
+    const unchangedSnapshot = previousVersion?.content_hash === contentHash && previousImportVersion === M3U_IMPORT_VERSION && previousStarterVersion === STARTER_VERIFICATION_VERSION && playlist.health === 'healthy' && restoreContent === undefined;
+    if (unchangedSnapshot && Number.isInteger(previousReport.valid) && previousReport.valid > 0 && previousReport.valid === Number(playlist.entry_count) && Array.isArray(previousReport.errors)) {
+      const current = await db.get(`UPDATE playlists SET health='healthy',error=NULL,last_sync=?,next_sync=? WHERE id=? AND ${configurationPredicate} RETURNING id`, [Date.now(), Date.now() + Number(playlist.interval_hours) * 3600000, playlistId, ...configurationValues]);
+      if (!current) return superseded();
+      return { importVersion: M3U_IMPORT_VERSION, starterVerificationVersion: STARTER_VERIFICATION_VERSION, starterChecks: 0, added: 0, updated: 0, removed: 0, unchanged: previousReport.valid, reviews: 0, repaired: 0, valid: previousReport.valid, processed: 0, batches: 0, errors: previousReport.errors, restored: false, contentChanged: false };
+    }
     const parsed = parseM3U(content);
     if (!parsed.entries.length) throw new Error('Playlist has no valid entries; existing catalog preserved');
+    const genericImages = genericPlaylistArtwork(parsed.entries);
+    for (const entry of parsed.entries) if (entry.type !== 'live' && genericImages.has(entry.poster)) entry.poster = '';
     const previousCount = Number(playlist.entry_count);
     if (!restoreContent && previousCount >= 10 && parsed.entries.length < previousCount * 0.2) throw new Error('Unexpected playlist shrink above 80%; existing catalog preserved for review');
     const report: Record<string, any> = { importVersion: M3U_IMPORT_VERSION, starterVerificationVersion: STARTER_VERIFICATION_VERSION, starterChecks: 0, added: 0, updated: 0, removed: 0, unchanged: 0, reviews: 0, repaired: 0, valid: parsed.entries.length, processed: 0, batches: 0, errors: parsed.errors, restored: restoreContent !== undefined };
-    const contentHash = hash(content); const previousVersion = await db.get('SELECT content_hash,report FROM playlist_versions WHERE playlist_id=? ORDER BY created_at DESC LIMIT 1', [playlistId]);
-    let previousImportVersion = 0; let previousStarterVersion = 0;
-    try { const previousReport = JSON.parse(previousVersion?.report || '{}'); previousImportVersion = previousReport.importVersion || 0; previousStarterVersion = previousReport.starterVerificationVersion || 0; } catch { /* Older or corrupt reports require reprocessing. */ }
-    if (!(await configurationCurrent())) return superseded();
-    if (previousVersion?.content_hash === contentHash && previousImportVersion === M3U_IMPORT_VERSION && previousStarterVersion === STARTER_VERIFICATION_VERSION && playlist.health === 'healthy' && !restoreContent) {
+    if (unchangedSnapshot) {
       const current = await db.get(`UPDATE playlists SET health='healthy',error=NULL,last_sync=?,next_sync=? WHERE id=? AND ${configurationPredicate} RETURNING id`, [Date.now(), Date.now() + Number(playlist.interval_hours) * 3600000, playlistId, ...configurationValues]);
       if (!current) return superseded();
       return { ...report, unchanged: parsed.entries.length, contentChanged: false };
@@ -227,15 +234,15 @@ export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: S
     const starterRunAfter = Math.min(Date.now(), ...healthHeads.filter(Boolean).map(row => Number(row!.run_after))) - 1;
     const old = await db.all('SELECT id,entry_key,url_hash,removed,title_id,episode_id,enabled,health,last_checked,last_success,failures,language,original_name FROM sources WHERE playlist_id=?', [playlistId]);
     const oldByKey = new Map(old.map(source => [source.entry_key, source]));
-    const oldMatches = Array.from({ length: 4 }, () => new Map<string, Row | null>());
-    for (const source of old) importSourceKeys(source.url_hash, source.language, source.original_name).forEach((key, level) => {
+    const needsFallback = old.length > 0 && parsed.entries.some(entry => !oldByKey.has(entry.key));
+    const oldMatches = Array.from({ length: needsFallback ? 4 : 0 }, () => new Map<string, Row | null>());
+    if (needsFallback) for (const source of old) importSourceKeys(source.url_hash, source.language, source.original_name).forEach((key, level) => {
       if (key !== null) oldMatches[level].set(key, oldMatches[level].has(key) ? null : source);
     });
-    const incomingKeys = new Set(parsed.entries.map(entry => entry.key));
+    const incomingKeys = new Set(needsFallback ? parsed.entries.map(entry => entry.key) : []);
     const incomingCounts = Array.from({ length: 4 }, () => new Map<string, number>());
     const entryHashes = parsed.entries.map(entry => hash(entry.url));
-    const entrySourceKeys = parsed.entries.map((entry, offset) => importSourceKeys(entryHashes[offset], entry.language, entry.name));
-    for (const keys of entrySourceKeys) keys.forEach((key, level) => { if (key !== null) incomingCounts[level].set(key, (incomingCounts[level].get(key) || 0) + 1); });
+    if (needsFallback) parsed.entries.forEach((entry, offset) => importSourceKeys(entryHashes[offset], entry.language, entry.name).forEach((key, level) => { if (key !== null) incomingCounts[level].set(key, (incomingCounts[level].get(key) || 0) + 1); }));
     // Metadata may replace an imported name with its confirmed English release
     // name. Load only aliases relevant to this playlist, using the alias index.
     const incomingNames = [...new Set(parsed.entries.map(entry => entry.normalized))]; const titleAliases: Row[] = [];
@@ -275,17 +282,34 @@ export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: S
        await assertConfiguration(tx);
        // PostgreSQL reports and imports share these locks. Acquire every batch URL
        // in order before row mutations, so concurrent imports cannot lock A/B in reverse.
-       if (tx.dialect === 'postgres') for (const urlHash of [...new Set(entryHashes.slice(start, start + batchSize))].sort()) await lockPlaybackUrl(tx, urlHash);
+       const batchHashes = entryHashes.slice(start, start + batchSize);
+       await lockImportUrls(tx, batchHashes);
+       const blockedUrls = await importPlaybackBlocks(tx, batchHashes.filter((urlHash, index) => { const source = oldByKey.get(parsed.entries[start + index].key); return !source || source.url_hash !== urlHash; }));
+       let newSources: unknown[][] = [], newChecks: unknown[][] = [], newReviews: unknown[][] = [];
+       let newStarters: Array<{ entry: PlaylistEntry; sourceId: string; titleId: string }> = [];
+       const flushNewSources = async () => {
+         await insertImportRows(tx, 'sources', ['id','title_id','episode_id','playlist_id','entry_key','name','original_name','language','url_encrypted','url_hash','format','health','error','failures','last_failure','playback_blocked','playback_blocked_at','created_at'], newSources);
+         await insertImportRows(tx, 'review_queue', ['id','source_id','title_id','candidate_id','reason','created_at'], newReviews);
+         // New random source IDs cannot already own retries or leases. Existing
+         // sources continue through enqueue(), which preserves those states.
+         await insertImportRows(tx, 'jobs', ['id','type','payload','status','run_after','created_at','dedupe_key'], newChecks, true);
+         for (const starter of newStarters) await prioritizeStarter(tx, starter.entry, starter.sourceId, starter.titleId);
+         newSources = []; newChecks = []; newReviews = []; newStarters = [];
+       };
        for (let offset = start; offset < Math.min(start + batchSize, parsed.entries.length); offset++) {
         const entry = parsed.entries[offset]; const urlHash = entryHashes[offset];
         let existing = oldByKey.get(entry.key);
+        const fallbackKeys = !existing && needsFallback ? importSourceKeys(urlHash, entry.language, entry.name) : [];
         if (!existing) for (let level = 0; level < oldMatches.length; level++) {
-          const key = entrySourceKeys[offset][level]; if (key === null || incomingCounts[level].get(key) !== 1) continue;
+          const key = fallbackKeys[level]; if (key === null || incomingCounts[level].get(key) !== 1) continue;
           const candidate = oldMatches[level].get(key);
           // Reserve exact keys for their own entries, even when those appear later.
           if (candidate && !incomingKeys.has(candidate.entry_key) && !activeIds.has(candidate.id)) { existing = candidate; break; }
         }
         if (existing) {
+          // Classification repair counts a title's sources. Make preceding new
+          // rows visible before that path, including mixed old/new provider lists.
+          await flushNewSources();
           activeIds.add(existing.id);
           const title = cache.rows.get(existing.title_id); const titleReviews = reviewsByTitle.get(existing.title_id) || [];
           let classificationOnly = !!title && !title.published && titleReviews.length > 0 && titleReviews.every(review => review.reason === CLASSIFICATION_REVIEW) && !locked.has(title.id);
@@ -340,7 +364,7 @@ export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: S
           cache.recordLanguage(existing.title_id, entry.language, entry.name);
           if (existing.url_hash !== urlHash || existing.removed) {
             if (existing.url_hash !== urlHash) {
-              const blocked = await playbackBlockForUrl(tx, urlHash);
+              const blocked = blockedUrls.get(urlHash);
               await tx.run('UPDATE sources SET url_encrypted=?,url_hash=?,format=?,health=?,quality=NULL,error=?,failures=?,successes=0,last_success=NULL,last_checked=NULL,last_failure=?,removed=0,playback_blocked=?,playback_blocked_at=? WHERE id=?', [encrypt(entry.url), urlHash, entry.format, blocked ? 'unavailable' : 'unknown', blocked ? blocked.error || 'Browser playback requires a verified retry' : null, blocked ? Math.max(1, Number(blocked.failures) || 0) : 0, blocked?.last_failure ?? null, blocked ? 1 : 0, blocked?.playback_blocked_at ?? null, existing.id]);
             }
             else await tx.run("UPDATE sources SET removed=0,health=CASE WHEN playback_blocked=1 THEN 'unavailable' ELSE 'unknown' END,quality=CASE WHEN playback_blocked=1 THEN quality ELSE NULL END,error=CASE WHEN playback_blocked=1 THEN error ELSE NULL END,failures=CASE WHEN playback_blocked=1 THEN failures ELSE 0 END,successes=CASE WHEN playback_blocked=1 THEN successes ELSE 0 END,last_success=CASE WHEN playback_blocked=1 THEN last_success ELSE NULL END,last_checked=CASE WHEN playback_blocked=1 THEN last_checked ELSE NULL END WHERE id=?", [existing.id]);
@@ -357,16 +381,17 @@ export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: S
         const identity = await identify(tx, entry, cache); const episodeId = await episodeFor(tx, identity.titleId, entry, episodeCache); const sourceId = id(); activeIds.add(sourceId);
         // Read inside the current batch so failures reported after the import began
         // are preserved too. The URL/playback index bounds this lookup on large catalogs.
-        const blocked = await playbackBlockForUrl(tx, urlHash);
-        await tx.run('INSERT INTO sources(id,title_id,episode_id,playlist_id,entry_key,name,original_name,language,url_encrypted,url_hash,format,health,error,failures,last_failure,playback_blocked,playback_blocked_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [sourceId, identity.titleId, episodeId, playlistId, entry.key, playlist.name, entry.name, entry.language, encrypt(entry.url), urlHash, entry.format, blocked ? 'unavailable' : 'unknown', blocked ? blocked.error || 'Browser playback requires a verified retry' : null, blocked ? Math.max(1, Number(blocked.failures) || 0) : 0, blocked?.last_failure ?? null, blocked ? 1 : 0, blocked?.playback_blocked_at ?? null, Date.now()]);
+        const blocked = blockedUrls.get(urlHash), now = Date.now();
+        newSources.push([sourceId, identity.titleId, episodeId, playlistId, entry.key, playlist.name, entry.name, entry.language, encrypt(entry.url), urlHash, entry.format, blocked ? 'unavailable' : 'unknown', blocked ? blocked.error || 'Browser playback requires a verified retry' : null, blocked ? Math.max(1, Number(blocked.failures) || 0) : 0, blocked?.last_failure ?? null, blocked ? 1 : 0, blocked?.playback_blocked_at ?? null, now]);
         cache.recordLanguage(identity.titleId, entry.language, entry.name);
-        if (identity.review) { await tx.run('INSERT INTO review_queue(id,source_id,title_id,candidate_id,reason,created_at) VALUES(?,?,?,?,?,?)', [id(), sourceId, identity.titleId, identity.review.candidateId, identity.review.reason, Date.now()]); report.reviews++; }
-        await enqueue(tx, 'health', { sourceId }, { dedupeKey: `health:${sourceId}` });
-        await prioritizeStarter(tx, entry, sourceId, identity.titleId);
+        if (identity.review) { newReviews.push([id(), sourceId, identity.titleId, identity.review.candidateId, identity.review.reason, now]); report.reviews++; }
+        newChecks.push([id(), 'health', JSON.stringify({ sourceId }), 'queued', now, now, `health:${sourceId}`]);
+        newStarters.push({ entry, sourceId, titleId: identity.titleId });
         // Metadata backfill is scheduled in bounded worker batches, rather than
         // queueing one remote lookup for every entry of a large playlist.
         report.added++;
        }
+       await flushNewSources();
       });
       report.processed = Math.min(start + batchSize, parsed.entries.length); report.batches++;
       await options.onBatch?.({ processed: report.processed, total: parsed.entries.length, batches: report.batches });
@@ -375,7 +400,7 @@ export async function synchronizePlaylist(db: DB, playlistId: string, fetcher: S
     const removed = old.filter(source => !activeIds.has(source.id) && !source.removed);
     if (parsed.errors.length && removed.length) report.removalsSuppressed = true;
     else for (let start = 0; start < removed.length; start += batchSize) {
-      await db.transaction(async tx => { await assertConfiguration(tx); for (const source of removed.slice(start, start + batchSize)) { await tx.run('UPDATE sources SET removed=1 WHERE id=?', [source.id]); report.removed++; } });
+      await db.transaction(async tx => { await assertConfiguration(tx); const ids = removed.slice(start, start + batchSize).map(source => source.id); await tx.run(`UPDATE sources SET removed=1 WHERE id IN (${ids.map(() => '?').join(',')})`, ids); report.removed += ids.length; });
       await yieldImport();
     }
     report.identityComparisons = cache.comparisons;

@@ -33,6 +33,10 @@ async function structuredFamily(name: string, copies: number) {
 }
 
 describe('explicit episode title parsing', () => {
+  it('reads explicit numbered provider season and episode labels', () => {
+    expect(parseEpisodeTitle('Lud, zbunjen, normalan (2020) : Season # 1 : Episode # 2')).toMatchObject({ title: 'Lud, zbunjen, normalan (2020)', season: 1, episode: 2 });
+    expect(parseEpisodeTitle('A Show S01 The Pilot')).toBeNull();
+  });
   it('groups EP/Episode variants before or after the same numbered show title', () => {
     const result = parseM3U(playlist(['S1 EP1 The 100 (2014) [EN]', '[DE] Season 1 Ep. 1 - The 100 (2014)', 'The 100 (2014) - S01 EP02 - Earth Skills', 'The 100 (2014) Season1 Episode3']));
     expect(result.errors).toEqual([]);

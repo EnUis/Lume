@@ -111,7 +111,7 @@ function seriesEntry(entry: PlaylistEntry): SeriesHint | null {
 function episodeMarkerSQL(db: DB, column: string) {
   // A broad SQL prefilter keeps memory bounded; the conservative parser makes
   // the actual decision. Include season badges to recover duplicated show names.
-  if (db.dialect === 'postgres') return `COALESCE(${column},'') ~* '(^|[^[:alnum:]])(s(eason){0,1}[[:space:]._-]*[0-9]{1,2}([[:space:]._:-]*(episode|ep|e)[[:space:]._-]*[0-9]{1,3}){0,1}|[0-9]{1,2}x[0-9]{1,3})([^[:alnum:]]|$)'`;
+  if (db.dialect === 'postgres') return `COALESCE(${column},'') ~* '(^|[^[:alnum:]])(s(eason){0,1}[[:space:].#:_-]*[0-9]{1,2}([[:space:]._:-]*(episode|ep|e)[[:space:].#:_-]*[0-9]{1,3}){0,1}|[0-9]{1,2}x[0-9]{1,3})([^[:alnum:]]|$)'`;
   return '(' + ['%season%', ...Array.from({ length: 10 }, (_, digit) => `%s${digit}%`), ...Array.from({ length: 10 }, (_, digit) => `%${digit}x%`)].map(pattern => `LOWER(COALESCE(${column},'')) LIKE '${pattern}'`).join(' OR ') + ')';
 }
 async function missingSeriesLabels(db: DB) {

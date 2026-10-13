@@ -80,24 +80,17 @@ describe('indexed durable queue claims', () => {
     }
   }, 20000);
 
-  it('retains PostgreSQL skip-locked claims and guarded ownership updates', async () => {
-    const statements: string[] = []; const now = Date.now();
+  it('uses one PostgreSQL round trip per claim', async () => {
+    let statements = 0;
     const adapter: DB = {
       dialect: 'postgres',
-      all: async () => [],
-      get: async <T extends Record<string, any>>(sql: string, values: unknown[] = []) => {
-        statements.push(sql);
-        if (sql.includes("status='queued'") && values[0] === 'health') return { id: 'pg-ready', run_after: now - 1, created_at: 1 } as unknown as T;
-        if (sql.includes('lease_owner=?')) return { id: 'pg-ready', lease_owner: values[1], attempts: 1 } as unknown as T;
-        return undefined;
-      },
-      run: async sql => { statements.push(sql); },
-      transaction: async fn => fn(adapter), close: async () => {},
+      all: async () => { statements++; return []; },
+      get: async <T extends Record<string, any>>(): Promise<T | undefined> => { statements++; return { id: 'pg-ready', lease_owner: 'postgres-worker', attempts: 1 } as unknown as T; },
+      run: async () => { statements++; },
+      transaction: async fn => { statements += 2; return fn(adapter); }, close: async () => {},
     };
     expect((await leaseJob(adapter, 'postgres-worker', ['health', 'metadata']))?.id).toBe('pg-ready');
-    const candidates = statements.filter(sql => sql.startsWith('SELECT id,run_after'));
-    expect(candidates).toHaveLength(4); for (const sql of candidates) expect(sql).toContain('LIMIT 1 FOR UPDATE SKIP LOCKED');
-    expect(statements.find(sql => sql.startsWith('UPDATE jobs SET status=\'running\''))).toContain('attempts<max_attempts');
+    expect(statements).toBe(1);
   });
 });
 

@@ -11,7 +11,7 @@ import { mergeTitles, splitSource, updateEpisode } from './management';
 import { authorizePlaybackSources } from './playback-access';
 import { adminOverview } from './admin-overview';
 import { existingPlaybackBlock, lockPlaybackUrl } from './playback-state';
-import { startMediaSession, stopMediaSession, streamMedia, mediaSessionStatus, MediaRuntimeError } from './media-runtime';
+import { startMediaSession, stopMediaSession, streamMedia, mediaHlsResource, mediaSessionStatus, MediaRuntimeError } from './media-runtime';
 
 const response = (data: unknown, status = 200, headers: Record<string, string> = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } });
 const text = (value: unknown, name: string, max = 200, min = 1) => { if (typeof value !== 'string' || value.trim().length < min || value.length > max) throw new AppError(400, `${name} must contain ${min}–${max} characters`); return value.trim(); };
@@ -120,6 +120,8 @@ export async function handleApi(request: Request, providedDB?: DB): Promise<Resp
       if (row!.title_type === 'live' && startAt !== 0) throw new AppError(400, 'Live TV starts at the current broadcast and cannot seek to a saved position');
       const audioTrack = data.audioTrack === undefined ? undefined : number(data.audioTrack, 'Audio track', 0, 1024);
       if (audioTrack !== undefined && !Number.isInteger(audioTrack)) throw new AppError(400, 'Audio track must be an integer');
+      if (data.delivery !== undefined && !['mp4', 'hls'].includes(data.delivery)) throw new AppError(400, 'Invalid playback delivery');
+      const delivery = data.delivery === 'hls' ? 'hls' : 'mp4';
       const grants = await authorizePlaybackSources([sourceRecord(row!, true)]); if (!grants[0]?.url) throw new AppError(503, 'Playback access could not be issued');
       if (typeof data.previousSessionId === 'string') stopMediaSession(data.previousSessionId, identity);
       const conversion = await startMediaSession({ sourceId, url: grants[0].url, urlHash: row!.url_hash, viewer: identity, startAt, audioTrack, live: row!.title_type === 'live' });
@@ -127,17 +129,30 @@ export async function handleApi(request: Request, providedDB?: DB): Promise<Resp
       const current = await playbackSourceRow(db, sourceId);
       if (!eligiblePlaybackSource(current) || current!.url_hash !== row!.url_hash || current!.playback_blocked_at !== row!.playback_blocked_at) { stopMediaSession(conversion.sessionId, identity); throw new AppError(409, 'The source changed while preparing playback'); }
       const access = encrypt(JSON.stringify({ kind: 'converted-video-v1', sessionId: conversion.sessionId, sourceId, urlHash: row!.url_hash, viewer: identity, expiresAt: Date.now() + 8 * 3600000, blockedAt: attempt.blockedAt }));
-      return response({ source: { ...grants[0], format: 'mp4', url: `/api/media/${conversion.sessionId}/stream.mp4?access=${encodeURIComponent(access)}`, conversionRequired: false, conversion, ...attemptFields(current!, identity) } });
+      return response({ source: { ...grants[0], format: delivery, url: `/api/media/${conversion.sessionId}/${delivery === 'hls' ? 'hls/index.m3u8' : 'stream.mp4'}?access=${encodeURIComponent(access)}`, conversionRequired: false, conversion, ...attemptFields(current!, identity) } });
     }
     if (path[0] === 'playback' && path[1] === 'release' && method === 'POST') { const data = await body(request, 2000); stopMediaSession(text(data.sessionId, 'Playback session', 64), identity); return response({ ok: true }); }
     if (path[0] === 'playback' && path[1] === 'session' && path[2] && method === 'GET') { const state = mediaSessionStatus(path[2], identity); return response({ status: state.status, classification: state.classification, error: state.error }); }
-    if (path[0] === 'media' && path[1] && path[2] === 'stream.mp4' && ['GET', 'HEAD'].includes(method)) {
+    if (path[0] === 'media' && path[1] && (path[2] === 'stream.mp4' || path[2] === 'hls' && /^(index\.m3u8|init\.mp4|segment-\d+\.m4s)$/.test(path[3] || '')) && ['GET', 'HEAD'].includes(method)) {
       let access: any; try { access = JSON.parse(decrypt(text(url.searchParams.get('access'), 'Playback access', 3000))); } catch { throw new AppError(403, 'Invalid playback access'); }
       if (access.kind !== 'converted-video-v1' || access.sessionId !== path[1] || access.viewer !== identity || !Number.isFinite(access.expiresAt) || access.expiresAt <= Date.now()) throw new AppError(403, 'Playback access expired');
       const row = await playbackSourceRow(db, access.sourceId);
       if (!eligiblePlaybackSource(row) || row!.url_hash !== access.urlHash || row!.playback_blocked && access.blockedAt !== Number(row!.playback_blocked_at)) throw new AppError(403, 'This source is no longer available');
       const session = mediaSessionStatus(path[1], identity);
       if (session.sourceId !== access.sourceId || session.urlHash !== access.urlHash) throw new AppError(403, 'Playback session does not match this source');
+      if (path[2] === 'hls') {
+        const resource = await mediaHlsResource(path[1], identity, path[3], `?access=${encodeURIComponent(url.searchParams.get('access')!)}`);
+        const headers: Record<string, string> = { 'Content-Type': resource.type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Length': String(resource.body.length), 'Accept-Ranges': 'bytes' };
+        const range = request.headers.get('range');
+        if (range && method === 'GET') {
+          const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+          const start = match ? Number(match[1]) : -1, end = match?.[2] ? Math.min(Number(match[2]), resource.body.length - 1) : resource.body.length - 1;
+          if (start < 0 || start > end || start >= resource.body.length) return new Response(null, { status: 416, headers: { ...headers, 'Content-Length': '0', 'Content-Range': `bytes */${resource.body.length}` } });
+          headers['Content-Range'] = `bytes ${start}-${end}/${resource.body.length}`; headers['Content-Length'] = String(end - start + 1);
+          return new Response(new Uint8Array(resource.body.subarray(start, end + 1)), { status: 206, headers });
+        }
+        return new Response(method === 'HEAD' ? null : new Uint8Array(resource.body), { headers });
+      }
       const headers = { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff' };
       if (method === 'HEAD') return new Response(null, { headers });
       return new Response(await streamMedia(path[1], identity, request.signal), { headers });
@@ -320,5 +335,6 @@ export async function handleApi(request: Request, providedDB?: DB): Promise<Resp
       if (path[1] === 'reviews' && path[2] && method === 'POST') { const data = await body(request); const review = await db.get("SELECT * FROM review_queue WHERE id=? AND status='pending'", [path[2]]); if (!review) throw new AppError(404, 'Review not found'); if (data.action === 'merge') { requireUser(user, ['admin']); const targetId = text(data.targetId || review.candidate_id, 'Target title', 64); await mergeTitles(db, review.title_id, targetId); } else if (data.action === 'reject') { await db.run('UPDATE titles SET published=1 WHERE id=?', [review.title_id]); } else if (data.action !== 'ignore') throw new AppError(400, 'Action must be merge, reject or ignore'); await db.run("UPDATE review_queue SET status='resolved' WHERE id=?", [path[2]]); await audit(db, actor.id, `review.${data.action}`, path[2]); return response({ ok: true }); }
     }
     throw new AppError(404, 'API endpoint not found');
-  } catch (error) { if (error instanceof MediaRuntimeError) return response({ error: error.message, classification: error.classification, code: error.code }, error.classification === 'source' ? 422 : 503, error.classification === 'capacity' ? { 'Retry-After': '5' } : {}); if (error instanceof AppError) return response({ error: error.message }, error.status); if (isSqliteBusy(error)) return response({ error: 'The database is busy. Please try again shortly.' }, 503, { 'Retry-After': '1' }); console.error(JSON.stringify({ level: 'error', event: 'api.failure', error: sanitizeError(error), time: Date.now() })); return response({ error: 'The request could not be completed. Please try again.' }, 500); }
+  } catch (error) { const unavailable = databaseUnavailableResponse(error); if (unavailable) return unavailable; if (error instanceof MediaRuntimeError) return response({ error: error.message, classification: error.classification, code: error.code }, error.classification === 'source' ? 422 : 503, error.classification === 'capacity' ? { 'Retry-After': '5' } : {}); if (error instanceof AppError) return response({ error: error.message }, error.status); if (isSqliteBusy(error)) return response({ error: 'The database is busy. Please try again shortly.' }, 503, { 'Retry-After': '1' }); console.error(JSON.stringify({ level: 'error', event: 'api.failure', error: sanitizeError(error), time: Date.now() })); return response({ error: 'The request could not be completed. Please try again.' }, 500); }
 }
+import { databaseUnavailableResponse } from './database-errors';

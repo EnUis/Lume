@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { probeMedia, startMediaSession, stopMediaSession, streamMedia, mediaSessionStatus } from '../lib/server/media-runtime';
+import { probeMedia, startMediaSession, stopMediaSession, streamMedia, mediaHlsResource, mediaSessionStatus } from '../lib/server/media-runtime';
 import { verifyStream } from '../lib/server/health';
 import { convertedSeek, mediaDuration, mediaPosition } from '../lib/playback';
 import { openDatabase } from '../lib/server/db';
@@ -20,6 +20,7 @@ beforeAll(async () => {
   execFileSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', join(directory, 'film.mkv'), '-map', '0:v', '-map', '0:a:0', '-c', 'copy', join(directory, 'film.avi')], { windowsHide: true, timeout: 30000, stdio: 'pipe' });
   execFileSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-stream_loop', '3', '-i', join(directory, 'film.mkv'), '-t', '24', '-map', '0:v', '-map', '0:a:0', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-f', 'mpegts', join(directory, 'channel.ts')], { windowsHide: true, timeout: 30000, stdio: 'pipe' });
   server = createServer((request, response) => {
+    if (request.url === '/stalled') { response.writeHead(200, { 'Content-Type': 'video/mp4' }); response.flushHeaders(); return; }
     if (request.url === '/denied') { response.writeHead(401); response.end('Denied'); return; }
     if (request.url === '/html') { response.setHeader('Content-Type', 'text/html'); response.end('<html>This is a login page rather than a video.</html>'); return; }
     if (request.url === '/continuous.ts') {
@@ -48,6 +49,14 @@ afterAll(async () => {
     rmSync(target, { recursive: true, force: true });
   }
 });
+
+it('keeps a stalled FFprobe within the remaining verification budget', async () => {
+  const started = Date.now();
+  await expect(probeMedia(base + '/stalled', { timeoutMs: 250 })).rejects.toMatchObject({ classification: 'source' });
+  // Allow Windows process-start overhead on a busy development machine while
+  // still rejecting the old unconditional 30-second probe timeout.
+  expect(Date.now() - started).toBeLessThan(15000);
+}, 20000);
 
 it('verifies actual MKV and AVI video instead of excluding a file extension, retaining both audio languages', async () => {
   const probe = await probeMedia(base + '/film.mkv'); expect(probe.duration).toBeGreaterThan(7); expect(probe.audioTracks.map(track => track.language)).toEqual(['eng', 'deu']);
@@ -79,6 +88,28 @@ it('does not turn canceled conversion or expired sessions into failed upstream f
   stopMediaSession(conversion.sessionId, 'test-viewer'); expect(() => mediaSessionStatus(conversion.sessionId, 'test-viewer')).toThrow(/expired/);
 });
 
+it('serves native-HLS compatible conversion fragments with real H264/AAC frames and no provider URLs', async () => {
+  const conversion = await startMediaSession({ sourceId: 'mobile-fixture', url: base + '/film.mkv', urlHash: 'mobile-hash', viewer: 'test-viewer' }); sessions.push(conversion.sessionId);
+  const resource = await mediaHlsResource(conversion.sessionId, 'test-viewer', 'index.m3u8', '?access=fixture');
+  const manifest = resource.body.toString();
+  expect(resource.type).toBe('application/vnd.apple.mpegurl');
+  expect(manifest).toContain('#EXT-X-MAP:URI="init.mp4?access=fixture"');
+  expect(manifest).toContain('#EXT-X-INDEPENDENT-SEGMENTS'); expect(manifest).not.toContain(base);
+  const files = manifest.split('\n').filter(line => line.startsWith('segment-')).map(line => line.split('?')[0]);
+  expect(files.length).toBeGreaterThanOrEqual(2);
+  const chunks = [(await mediaHlsResource(conversion.sessionId, 'test-viewer', 'init.mp4')).body];
+  for (const file of files) chunks.push((await mediaHlsResource(conversion.sessionId, 'test-viewer', file)).body);
+  const output = join(directory, 'mobile-hls.mp4'); writeFileSync(output, Buffer.concat(chunks));
+  const metadata = JSON.parse(execFileSync(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,pix_fmt:format=duration', '-of', 'json', output], { windowsHide: true, encoding: 'utf8', timeout: 10000 }));
+  expect(metadata.streams.map((stream: any) => stream.codec_name)).toEqual(['h264', 'aac']);
+  expect(metadata.streams[0].pix_fmt).toBe('yuv420p');
+  const seconds = [...manifest.matchAll(/#EXTINF:([\d.]+)/g)].reduce((sum, match) => sum + Number(match[1]), 0);
+  expect(Math.abs(Number(metadata.format.duration) - seconds)).toBeLessThan(0.2);
+  execFileSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-i', output, '-frames:v', '3', '-f', 'null', '-'], { windowsHide: true, timeout: 10000, stdio: 'pipe' });
+  await expect(mediaHlsResource(conversion.sessionId, 'other-viewer', 'index.m3u8')).rejects.toMatchObject({ classification: 'transient' });
+  stopMediaSession(conversion.sessionId, 'test-viewer');
+}, 30000);
+
 it('starts a continuous HTTP MPEG-TS broadcast at the live edge without a saved duration or seek', async () => {
   const conversion = await startMediaSession({ sourceId: 'live-fixture', url: base + '/continuous.ts', urlHash: 'live-fixture-hash', viewer: 'test-viewer', startAt: 120, live: true }); sessions.push(conversion.sessionId);
   expect(conversion.duration).toBeNull(); expect(conversion.startAt).toBe(0);
@@ -98,6 +129,26 @@ it('keeps original movie duration and position across converted seeks instead of
   expect(convertedSeek(135, conversion, ranges)).toEqual({ restart: false, local: 15 });
   expect(convertedSeek(3600, conversion, ranges).restart).toBe(true); expect(convertedSeek(20, conversion, ranges).restart).toBe(true);
 });
+
+it('counts completed HLS buffers against conversion capacity until the viewer releases them', async () => {
+  const previous = process.env.MEDIA_MAX_PROCESSES; process.env.MEDIA_MAX_PROCESSES = '1';
+  let first: string | undefined, next: string | undefined;
+  try {
+    const input = { sourceId: 'completed-mobile', url: base + '/film.mkv', urlHash: 'completed-hash', viewer: 'test-viewer', startAt: 6 };
+    first = (await startMediaSession(input)).sessionId;
+    next = (await startMediaSession(input)).sessionId;
+    const playlist = await mediaHlsResource(first, 'test-viewer', 'index.m3u8');
+    expect(playlist.body.toString()).toContain('#EXT-X-ENDLIST');
+    expect(mediaSessionStatus(first, 'test-viewer').status).toBe('complete');
+    await expect(startMediaSession(input)).rejects.toMatchObject({ classification: 'capacity' });
+    await expect(mediaHlsResource(next, 'test-viewer', 'index.m3u8')).rejects.toMatchObject({ classification: 'capacity' });
+    stopMediaSession(first, 'test-viewer'); first = undefined;
+    expect((await mediaHlsResource(next, 'test-viewer', 'index.m3u8')).body.toString()).toContain('#EXT-X-ENDLIST');
+  } finally {
+    if (first) stopMediaSession(first, 'test-viewer'); if (next) stopMediaSession(next, 'test-viewer');
+    if (previous === undefined) delete process.env.MEDIA_MAX_PROCESSES; else process.env.MEDIA_MAX_PROCESSES = previous;
+  }
+}, 30000);
 
 it('authorizes conversion against saved sources and revokes media access after source changes', async () => {
   const db = await openDatabase(':memory:');
@@ -123,8 +174,22 @@ it('authorizes conversion against saved sources and revokes media access after s
     const path = source.url.replace('/api/', '');
     expect((await api(path, 'HEAD')).headers.get('content-type')).toBe('video/mp4');
     expect((await api(path.replace(sessionId!, '0'.repeat(48)), 'HEAD')).status).toBe(403);
+    expect((await api('playback/prepare', 'POST', { ...input, delivery: 'unsafe' })).status).toBe(400);
+    const mobilePrepared = await api('playback/prepare', 'POST', { ...input, previousSessionId: sessionId, delivery: 'hls' });
+    expect(mobilePrepared.status).toBe(200); const mobileSource = (await mobilePrepared.json()).source;
+    sessionId = mobileSource.conversion.sessionId;
+    expect(mobileSource.format).toBe('hls'); expect(mobileSource.url).toContain('/hls/index.m3u8?access=');
+    const mobilePath = mobileSource.url.replace('/api/', '');
+    const playlistResponse = await api(mobilePath); expect(playlistResponse.status).toBe(200);
+    const playlist = await playlistResponse.text(); expect(playlist).not.toContain(base);
+    const initName = playlist.match(/#EXT-X-MAP:URI="([^"]+)"/)![1];
+    const initUrl = new URL(initName, origin + '/api/' + mobilePath);
+    const ranged = await handleApi(new Request(initUrl, { headers: { origin, range: 'bytes=0-1' } }), db);
+    expect(ranged.status).toBe(206); expect(ranged.headers.get('content-range')).toMatch(/^bytes 0-1\/\d+$/); expect((await ranged.arrayBuffer()).byteLength).toBe(2);
+    initUrl.searchParams.set('access', 'invalid'); expect((await handleApi(new Request(initUrl), db)).status).toBe(403);
     await db.run('UPDATE sources SET enabled=0 WHERE id=?', [row.id]);
     expect((await api(path, 'HEAD')).status).toBe(403);
+    expect((await api(mobilePath)).status).toBe(403);
     expect((await api('playback/prepare', 'POST', input)).status).toBe(404);
     await db.run('UPDATE sources SET enabled=1,url_hash=? WHERE id=?', [hash(base + '/other.mkv'), row.id]);
     expect((await api('playback/prepare', 'POST', input)).status).toBe(409);

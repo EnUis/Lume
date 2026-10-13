@@ -4,6 +4,7 @@ import { ImportIdentityIndex, createTitle, synchronizePlaylist } from '../lib/se
 import { parseM3U, M3U_IMPORT_VERSION } from '../lib/server/m3u';
 import { encrypt, hash, id } from '../lib/server/security';
 import { leaseJob } from '../lib/server/jobs';
+import { importPlaybackBlocks, lockImportUrls } from '../lib/server/import-batches';
 
 let db: DB;
 beforeEach(async () => { db = await openDatabase(':memory:'); });
@@ -61,6 +62,56 @@ describe('bounded identity work', () => {
 });
 
 describe('durable batched imports', () => {
+  it('batches source and job writes and skips catalog work for unchanged snapshots', async () => {
+    const count = 1000, batchSize = 100;
+    const content = '#EXTM3U\n' + Array.from({ length: count }, (_, n) => section(`Unique fixture ${n}`, `movie/${n}.mp4`)).join('');
+    const playlistId = await playlist(content), queries: string[] = [];
+    const trace = (delegate: DB): DB => ({ ...delegate,
+      all: async <T extends Row>(sql: string, values: unknown[] = []) => { queries.push(sql); return delegate.all<T>(sql, values); },
+      get: async <T extends Row>(sql: string, values: unknown[] = []) => { queries.push(sql); return delegate.get<T>(sql, values); },
+      run: async (sql, values) => { queries.push(sql); return delegate.run(sql, values); },
+      transaction: fn => delegate.transaction(tx => fn(trace(tx))),
+    });
+    const traced = trace(db);
+    expect(await synchronizePlaylist(traced, playlistId, undefined, undefined, { batchSize })).toMatchObject({ added: count, batches: 10 });
+    expect(queries.filter(sql => sql.startsWith('INSERT INTO sources('))).toHaveLength(10);
+    expect(queries.filter(sql => sql.startsWith('INSERT INTO jobs('))).toHaveLength(10);
+    expect(queries.filter(sql => sql.startsWith('WITH requested(url_hash)'))).toHaveLength(10);
+    expect(queries.length).toBeLessThan(1100);
+    expect((await db.get("SELECT COUNT(*) n FROM jobs WHERE type='health'"))?.n).toBe(count);
+    expect((await db.get("SELECT COUNT(*) n FROM sources WHERE health='unknown' AND last_checked IS NULL AND playback_blocked=0"))?.n).toBe(count);
+    queries.length = 0;
+    expect(await synchronizePlaylist(traced, playlistId)).toMatchObject({ unchanged: count, contentChanged: false, batches: 0 });
+    expect(queries).toHaveLength(4);
+    expect(queries.some(sql => /FROM (sources|titles)|INSERT INTO/.test(sql))).toBe(false);
+  }, 20000);
+
+  it('acquires PostgreSQL URL locks in one ordered query using the playback-report lock keys', async () => {
+    const calls: Array<{ sql: string; values?: unknown[] }> = [];
+    const postgres = { ...db, dialect: 'postgres' as const, run: async (sql: string, values?: unknown[]) => { calls.push({ sql, values }); } };
+    const a = '0000000180000002' + '0'.repeat(48), b = 'ffffffff00000003' + '0'.repeat(48);
+    await lockImportUrls(postgres, [b, a, b]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].values).toEqual([1, -2147483646, -1, 3]);
+    expect(calls[0].sql).toContain('ORDER BY position OFFSET 0');
+    await lockImportUrls(postgres, []); expect(calls).toHaveLength(1);
+  });
+
+  it('loads only the latest blocked reference per URL through the index in a single batch', async () => {
+    const playlistId = await playlist('#EXTM3U\n' + section('Shared film', 'movie/shared.mp4'));
+    await synchronizePlaylist(db, playlistId);
+    const source = (await db.get('SELECT id,title_id,url_hash,url_encrypted FROM sources LIMIT 1'))!;
+    await db.run("UPDATE sources SET playback_blocked=1,playback_blocked_at=20,error='Latest browser failure',failures=4 WHERE id=?", [source.id]);
+    await db.run("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<1000) INSERT INTO sources(id,title_id,entry_key,name,url_encrypted,url_hash,playback_blocked,playback_blocked_at,error,created_at) SELECT 'copy-'||n,?,'copy-'||n,'Other reference',?,?,1,10,'Older failure',0 FROM seq", [source.title_id, source.url_encrypted, source.url_hash]);
+    const calls: Array<{ sql: string; values: unknown[]; rows: number }> = [];
+    const traced: DB = { ...db, all: async <T extends Row>(sql: string, values: unknown[] = []) => { const rows = await db.all<T>(sql, values); calls.push({ sql, values, rows: rows.length }); return rows; } };
+    const blocks = await importPlaybackBlocks(traced, [source.url_hash, source.url_hash, hash('another URL')]);
+    expect(calls).toHaveLength(1); expect(calls[0].rows).toBe(1);
+    expect(blocks.get(source.url_hash)).toMatchObject({ playback_blocked_at: 20, error: 'Latest browser failure', failures: 4 });
+    const plan = (await db.all('EXPLAIN QUERY PLAN ' + calls[0].sql, calls[0].values)).map(row => row.detail).join(' ');
+    expect(plan).toContain('sources_url_playback_reference'); expect(plan).not.toMatch(/SCAN candidate|TEMP B-TREE/i);
+  });
+
   it('uses bounded encrypted configuration fingerprints for large uploaded content across batches, cache hits and failures', async () => {
     const content = '#EXTM3U\n#' + 'padding'.repeat(300000) + '\n' + Array.from({ length: 4 }, (_, n) => section(`Bounded Film ${n}`, `movie/${n}.mp4`)).join('');
     const playlistId = await playlist(content); let initialReads = 0;
