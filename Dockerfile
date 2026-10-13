@@ -1,4 +1,3 @@
-
 FROM node:24-bookworm-slim AS build
 WORKDIR /app
 COPY package*.json ./
@@ -36,8 +35,3 @@ RUN chmod 755 /app/render-start.sh
 USER luma
 EXPOSE 3000
 CMD ["sh", "/app/render-start.sh"]
-# Worker and administrator commands use tsx, so retain the locked runtime dependencies.
-COPY --from=build --chown=luma /app/node_modules ./node_modules
-USER luma
-EXPOSE 3000
-CMD ["node", "server.js"]
