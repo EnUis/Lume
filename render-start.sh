@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
 
-# =====================================
-# LUME — RENDER STARTUP
+# ==========================================
+# LUME - RENDER PRODUCTION STARTUP
 # Tailscale + PostgreSQL + Next.js
-# =====================================
+# ==========================================
 
 : "${TAILSCALE_DB_HOST:?Missing TAILSCALE_DB_HOST}"
+: "${DATABASE_URL:?Missing DATABASE_URL}"
 
 KEY_FILE="/etc/secrets/tailscale-authkey"
 TS_DIR="/tmp/lume-tailscale"
@@ -16,9 +17,9 @@ SOCKS_PORT=1055
 GATEWAY_PORT=15432
 REMOTE_DB_PORT=5432
 
-# =====================================
-# CHECK TAILSCALE AUTHENTICATION KEY
-# =====================================
+# ==========================================
+# CHECK TAILSCALE AUTH KEY
+# ==========================================
 
 if [ ! -r "$KEY_FILE" ]; then
     echo "ERROR: Tailscale authentication key missing"
@@ -27,9 +28,9 @@ fi
 
 mkdir -p "$TS_DIR"
 
-# =====================================
-# START TAILSCALE
-# =====================================
+# ==========================================
+# START TAILSCALE DAEMON
+# ==========================================
 
 echo "Starting Tailscale..."
 
@@ -39,7 +40,9 @@ tailscaled \
     --state="$TS_DIR/state" \
     --socks5-server="127.0.0.1:$SOCKS_PORT" &
 
-# Wait for Tailscale socket
+TS_PID=$!
+
+# Wait for socket
 i=0
 
 until [ -S "$TS_SOCKET" ]; do
@@ -50,12 +53,17 @@ until [ -S "$TS_SOCKET" ]; do
         exit 1
     fi
 
+    if ! kill -0 "$TS_PID" 2>/dev/null; then
+        echo "ERROR: Tailscale daemon stopped"
+        exit 1
+    fi
+
     sleep 1
 done
 
-# =====================================
+# ==========================================
 # AUTHENTICATE TAILSCALE
-# =====================================
+# ==========================================
 
 echo "Authenticating Tailscale..."
 
@@ -66,31 +74,47 @@ tailscale --socket="$TS_SOCKET" up \
 
 echo "Tailscale authenticated"
 
-# =====================================
-# TEST REMOTE POSTGRESQL CONNECTION
-# =====================================
+# ==========================================
+# CHECK DATABASE NETWORK CONNECTION
+# ==========================================
 
-echo "Checking PostgreSQL reachability through Tailscale..."
+echo "Checking PostgreSQL through Tailscale..."
 
-if ncat \
-    --proxy "127.0.0.1:$SOCKS_PORT" \
-    --proxy-type socks5 \
-    --wait 12 \
-    --zero \
-    "$TAILSCALE_DB_HOST" "$REMOTE_DB_PORT"
-then
-    echo "PostgreSQL TCP connection through Tailscale successful"
-else
-    echo "ERROR: Cannot reach PostgreSQL through Tailscale"
-    echo "Check Tailscale access rules and PC database availability"
+CONNECTED=false
+ATTEMPT=1
+
+while [ "$ATTEMPT" -le 5 ]; do
+
+    echo "Database connection test $ATTEMPT/5"
+
+    if ncat \
+        --proxy "127.0.0.1:$SOCKS_PORT" \
+        --proxy-type socks5 \
+        --wait 10 \
+        -z \
+        "$TAILSCALE_DB_HOST" "$REMOTE_DB_PORT"
+    then
+        CONNECTED=true
+        break
+    fi
+
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep 2
+done
+
+if [ "$CONNECTED" != "true" ]; then
+    echo "ERROR: PostgreSQL is unreachable through Tailscale"
+    echo "Check Tailscale ACLs, Windows Tailscale Serve, and PostgreSQL"
     exit 1
 fi
 
-# =====================================
-# START POSTGRESQL LOCAL TCP GATEWAY
-# =====================================
+echo "PostgreSQL TCP connection successful"
 
-echo "Starting PostgreSQL TCP gateway..."
+# ==========================================
+# START LOCAL POSTGRESQL GATEWAY
+# ==========================================
+
+echo "Starting PostgreSQL gateway..."
 
 ncat \
     --listen 127.0.0.1 "$GATEWAY_PORT" \
@@ -99,16 +123,22 @@ ncat \
 
 GATEWAY_PID=$!
 
-sleep 1
+sleep 2
 
 if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    echo "ERROR: PostgreSQL gateway process failed"
+    echo "ERROR: PostgreSQL gateway failed to start"
     exit 1
 fi
 
-echo "PostgreSQL gateway listening on localhost:$GATEWAY_PORT"
+echo "PostgreSQL gateway listening on 127.0.0.1:$GATEWAY_PORT"
 
-# =====================================
+# ==========================================
+# START LUME WEBSITE
+# ==========================================
+
+echo "Starting Lume web server..."
+
+exec node server.js
 # START LUME APPLICATION
 # =====================================
 
