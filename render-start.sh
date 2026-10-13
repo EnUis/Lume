@@ -40,9 +40,11 @@ tailscale --socket="$TS_SOCKET" up \
 
 echo "Tailscale authenticated"
 
+
 socat \
   TCP-LISTEN:15432,bind=127.0.0.1,reuseaddr,fork \
-  "SOCKS5:127.0.0.1:${TAILSCALE_DB_HOST}:5432,socksport=1055" &
+  EXEC:"ncat --proxy 127.0.0.1:1055 --proxy-type socks5 ${TAILSCALE_DB_HOST} 5432" &
+  
 
 echo "PostgreSQL gateway configured on localhost:15432"
 
